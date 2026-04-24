@@ -1,0 +1,1066 @@
+"""
+交通流量分析系统 - AI服务（优化版）
+整合开题报告改进点：
+1. 增强DeepSORT（外观特征）
+2. 轨迹插值
+3. 图像自适应增强
+"""
+# ai_service/main_optimized.py
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pathlib import Path
+import cv2
+import numpy as np
+import json
+import time
+import base64
+from io import BytesIO
+import shutil
+import uuid
+import redis
+import logging
+from typing import List, Optional, Dict
+from datetime import datetime
+import subprocess
+import sys
+import math
+
+# 导入优化模块
+from config import config
+from enhanced_tracker import EnhancedDeepSORT
+from trajectory_interpolator import TrajectoryInterpolator
+from image_enhancement import ImageEnhancer
+from detection_line import DetectionLine, parse_detection_line, default_vertical_line
+import logging
+from pathlib import Path
+
+import math
+
+class StaticObjectFilter:
+    """
+    轨迹静止过滤器：杀掉长期位移为0的背景误检（建筑、树木）
+    改进：记录轨迹的累计位移，曾经运动过的目标（如等红灯车辆）即使当前静止也保留
+    """
+    def __init__(self, min_displacement=40, min_history=5, max_history=20):
+        self.min_displacement = min_displacement
+        self.min_history = min_history
+        self.max_history = max_history
+        self.history = {}          # track_id -> [(cx, cy), ...]
+        self.lifetime_disp = {}    # track_id -> float, 从出生到现在的累计位移
+
+    def update(self, tracks):
+        current_ids = set()
+        filtered = []
+
+        for t in tracks:
+            tid = t['track_id']
+            current_ids.add(tid)
+            bbox = t['bbox']
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+
+            if tid not in self.history:
+                self.history[tid] = []
+                self.lifetime_disp[tid] = 0.0
+
+            # 计算与上一个记录点的位移，累加到终身位移
+            if len(self.history[tid]) > 0:
+                last_cx, last_cy = self.history[tid][-1]
+                step_disp = math.hypot(cx - last_cx, cy - last_cy)
+                self.lifetime_disp[tid] += step_disp
+
+            self.history[tid].append((cx, cy))
+            if len(self.history[tid]) > self.max_history:
+                self.history[tid].pop(0)
+
+            # 历史不足先保留（避免新目标被误杀）
+            if len(self.history[tid]) < self.min_history:
+                filtered.append(t)
+                continue
+
+            # 关键：看"终身累计位移"而不是"窗口内位移"
+            # 曾经运动过 -> 真实车辆（等红灯也保留）
+            # 从未运动过 -> 背景误检（建筑、树木）
+            if self.lifetime_disp.get(tid, 0) < self.min_displacement:
+                continue  # 过滤掉从未动过的幽灵目标
+
+            filtered.append(t)
+
+        # 清理消失轨迹
+        for tid in list(self.history.keys()):
+            if tid not in current_ids:
+                del self.history[tid]
+                self.lifetime_disp.pop(tid, None)
+
+        return filtered
+
+    def reset(self):
+        self.history.clear()
+        self.lifetime_disp.clear()
+
+
+# ============ 统一日志配置（服务入口唯一控制） ============
+# 使用 config.LOG_DIR，确保路径一致；启动时自动清空旧日志
+config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+log_file = config.LOG_DIR / "ai_service.log"
+
+# 启动时清空历史日志
+if log_file.exists():
+    log_file.write_text("")
+
+# 配置根logger，捕获所有子模块（enhanced_tracker、interpolator等）日志
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+# 避免重复添加（热重载/调试时可能重复执行）
+for h in root_logger.handlers[:]:
+    if isinstance(h, logging.FileHandler):
+        root_logger.removeHandler(h)
+
+file_handler = logging.FileHandler(
+    str(log_file),
+    encoding='utf-8',
+    mode='a'  # 用 'a' 追加，但启动时已清空，等效于全新文件
+)
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# 业务模块logger（自动传播到根logger）
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# 如需在控制台也看ERROR级别（一般不需要），取消下面注释：
+# console_handler = logging.StreamHandler(sys.stdout)
+# console_handler.setLevel(logging.ERROR)
+# logger.addHandler(console_handler)
+
+# 确保目录存在
+config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+config.RESULTS_DIR.mkdir(exist_ok=True)
+config.LOG_DIR.mkdir(exist_ok=True)
+
+app = FastAPI(title="交通流量分析系统 - 推理服务（优化版）", version="3.1.0")
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Redis连接
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    logger.info("Redis连接成功")
+except Exception as e:
+    logger.warning(f"Redis连接失败: {e}，将使用内存存储")
+    redis_client = None
+
+memory_storage = {}
+active_tasks = {}
+
+# ============ 初始化核心组件 ============
+
+_model_file = Path(config.MODEL_PATH)
+if not _model_file.is_file():
+    logger.error(
+        "未找到 ONNX 模型文件: %s\n请将 rtdetr_detrac.onnx 放入目录: %s",
+        _model_file.resolve(),
+        (config.BASE_DIR / "weights").resolve(),
+    )
+
+# 初始化检测器（保持原有逻辑，从test_inference_new导入）
+try:
+    from test_inference_new import RTDETRPredictor
+
+    detector = RTDETRPredictor(
+        config.MODEL_PATH,
+        use_onnx=True,
+        conf_threshold=config.CONF_THRESHOLD,
+        nms_threshold=config.NMS_THRESHOLD
+    )
+    logger.info("✅ RT-DETR模型加载成功")
+    model_loaded = True
+except Exception as e:
+    logger.error(f"❌ 模型加载失败: {e}")
+    model_loaded = False
+
+# 初始化增强组件
+tracker = EnhancedDeepSORT(
+    max_age=config.TRACKER_MAX_AGE,
+    min_hits=config.TRACKER_MIN_HITS,
+    iou_threshold=config.TRACKER_IOU_THRESH,
+    appearance_weight=config.APPEARANCE_WEIGHT,
+    use_appearance=config.ENABLE_APPEARANCE,
+    enable_cmc=config.ENABLE_CMC
+)
+
+interpolator = TrajectoryInterpolator(max_gap=config.MAX_INTERP_GAP)
+enhancer = ImageEnhancer(enable_enhancement=config.ENABLE_ENHANCEMENT)
+
+# 如果模型加载失败，使用简单模拟器（测试用）
+if not model_loaded:
+    class SimpleDetector:
+        def __init__(self):
+            self.class_names = ['car', 'bus', 'van', 'others']
+            import random
+            self.random = random
+
+        def predict(self, frame):
+            time.sleep(0.05)  # 模拟延迟
+            h, w = frame.shape[:2]
+            dets = []
+            for i in range(self.random.randint(1, 5)):
+                x1 = self.random.randint(50, w - 200)
+                y1 = self.random.randint(50, h - 200)
+                x2 = x1 + self.random.randint(60, 150)
+                y2 = y1 + self.random.randint(60, 120)
+                dets.append({
+                    'class_name': self.random.choice(self.class_names),
+                    'score': self.random.uniform(0.6, 0.95),
+                    'bbox': [float(x1), float(y1), float(x2), float(y2)]
+                })
+            return dets, 0.05
+
+
+    detector = SimpleDetector()
+    logger.warning("⚠️ 使用模拟检测器（测试模式）")
+
+# ============ 虚拟检测线和流量统计（保持原有） ============
+
+class TrafficCounter:
+    def __init__(
+            self,
+            lines: List[DetectionLine],
+            frame_width: int,
+            frame_height: int,
+            fps: float,
+            meters_per_pixel: float,
+    ):
+        self.lines = lines
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.fps = max(fps, 1e-3)
+        self.meters_per_pixel = meters_per_pixel
+        self.counts = {line.name: {'in': 0, 'out': 0} for line in lines}
+        self.vehicle_history = {}
+        self.violations = []
+        self.stationary_frames = {}
+        self.track_classes = {}
+        self.track_last_pos = {}  # track_id -> (frame_idx, cx, cy)
+        self.speed_samples_mps: List[float] = []
+        self._parking_fired = set()
+
+    def update(self, tracks: List[Dict], frame_idx: int, timestamp: float):
+        current_tracks = {}
+        frame_diag = math.hypot(self.frame_width, self.frame_height)
+        still_px = max(5.0, 0.002 * frame_diag)
+
+        for track in tracks:
+            track_id = track['track_id']
+            bbox = track['bbox']
+            center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+            class_name = track.get('class_name', 'car')
+
+            if track_id not in self.track_classes:
+                self.track_classes[track_id] = class_name
+
+            current_tracks[track_id] = {
+                'center': center,
+                'bbox': bbox,
+                'class': self.track_classes[track_id],
+                'is_interpolated': track.get('is_interpolated', False)
+            }
+
+            if track.get('is_interpolated', False):
+                continue
+
+            # 车速（相邻采样帧位移 / 时间）
+            if track_id in self.track_last_pos:
+                pf, px, py = self.track_last_pos[track_id]
+                dt = (frame_idx - pf) / self.fps
+                if dt > 1e-6:
+                    dpx = math.hypot(center[0] - px, center[1] - py)
+                    v_mps = dpx * self.meters_per_pixel / dt
+                    if v_mps < 55:  # 过滤异常跳变（约 200km/h）
+                        self.speed_samples_mps.append(v_mps)
+            self.track_last_pos[track_id] = (frame_idx, center[0], center[1])
+
+            if track_id in self.vehicle_history:
+                last_pos = self.vehicle_history[track_id]['center']
+
+                for line in self.lines:
+                    line_px = (
+                        line.x1 * self.frame_width,
+                        line.y1 * self.frame_height,
+                        line.x2 * self.frame_width,
+                        line.y2 * self.frame_height
+                    )
+
+                    if self._crosses_line(last_pos, center, line_px):
+                        direction = self._determine_direction(last_pos, center, line)
+                        vehicle_type = self.track_classes[track_id]
+
+                        if direction == 'in':
+                            self.counts[line.name]['in'] += 1
+                            self.counts[line.name].setdefault(f'{vehicle_type}_in', 0)
+                            self.counts[line.name][f'{vehicle_type}_in'] += 1
+                        else:
+                            self.counts[line.name]['out'] += 1
+                            self.counts[line.name].setdefault(f'{vehicle_type}_out', 0)
+                            self.counts[line.name][f'{vehicle_type}_out'] += 1
+
+                            if line.one_way:
+                                self.violations.append({
+                                    'type': 'wrong_direction',
+                                    'track_id': track_id,
+                                    'vehicle_type': vehicle_type,
+                                    'timestamp': timestamp,
+                                    'frame': frame_idx,
+                                    'location': [float(center[0]), float(center[1])],
+                                    'line': line.name,
+                                    'reason': 'one_way_out',
+                                })
+
+            if track_id in self.stationary_frames:
+                info = self.stationary_frames[track_id]
+                dx = center[0] - info['position'][0]
+                dy = center[1] - info['position'][1]
+                distance = math.hypot(dx, dy)
+
+                if distance < still_px:
+                    info['frames'] += 1
+                    if info['frames'] > 90 and track_id not in self._parking_fired:
+                        self.violations.append({
+                            'type': 'illegal_parking',
+                            'track_id': track_id,
+                            'vehicle_type': class_name,
+                            'timestamp': timestamp,
+                            'frame': frame_idx,
+                            'location': [float(center[0]), float(center[1])],
+                        })
+                        self._parking_fired.add(track_id)
+                        info['frames'] = 0
+                else:
+                    info['position'] = center
+                    info['frames'] = 0
+            else:
+                self.stationary_frames[track_id] = {'position': center, 'frames': 0}
+
+        self.vehicle_history = current_tracks
+
+        return {
+            'counts': self.counts,
+            'active_vehicles': len(current_tracks),
+            'total_violations': len(self.violations)
+        }
+
+    def _crosses_line(self, p1, p2, line):
+        def ccw(A, B, C):
+            return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+
+        A, B = (line[0], line[1]), (line[2], line[3])
+        C, D = p1, p2
+        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+    def _determine_direction(self, p1, p2, line):
+        if line.direction == 'vertical':
+            return 'in' if p2[0] > p1[0] else 'out'
+        else:
+            return 'in' if p2[1] > p1[1] else 'out'
+
+    def speed_summary(self) -> Dict:
+        if not self.speed_samples_mps:
+            return {
+                'avg_mps': 0.0, 'max_mps': 0.0, 'avg_kmh': 0.0, 'max_kmh': 0.0,
+                'samples': 0, 'meters_per_pixel_assumed': self.meters_per_pixel
+            }
+        arr = np.array(self.speed_samples_mps, dtype=np.float32)
+        avg = float(np.mean(arr))
+        mx = float(np.max(arr))
+        return {
+            'avg_mps': round(avg, 3),
+            'max_mps': round(mx, 3),
+            'avg_kmh': round(avg * 3.6, 2),
+            'max_kmh': round(mx * 3.6, 2),
+            'samples': len(self.speed_samples_mps),
+            'meters_per_pixel_assumed': self.meters_per_pixel,
+        }
+
+
+# ============ 可视化工具（优化显示轨迹） ============
+
+class ResultVisualizer:
+    COLORS = {
+        'car': (0, 255, 0),  # 绿
+        'bus': (255, 165, 0),  # 橙
+        'van': (0, 0, 255),  # 红
+        'others': (128, 128, 128),  # 灰
+        'default': (255, 255, 0)  # 青
+    }
+
+    @staticmethod
+    def draw_detection(frame: np.ndarray, track: Dict):
+        bbox = track['bbox']
+        track_id = track.get('track_id', 0)
+        score = track.get('score', 0)
+        class_name = track.get('class_name', 'unknown')
+        is_interp = track.get('is_interpolated', False)
+        status = track.get('status', 'unknown')
+
+        # 颜色：confirmed=绿，tentative=黄，interp=灰
+        if is_interp:
+            color = (128, 128, 128)
+        elif status == 'tentative':
+            color = (0, 255, 255)  # 青色
+        else:
+            color = ResultVisualizer.COLORS.get(class_name, (0, 255, 0))
+
+        x1, y1, x2, y2 = map(int, bbox)
+        thickness = 1 if is_interp else 2
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+        label = f"{class_name} ID:{track_id} {score:.2f}"
+        if is_interp:
+            label += " (interp)"
+        elif status == 'tentative':
+            label += " (new)"
+
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
+        cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        return frame
+
+    @staticmethod
+    def draw_detection_line(frame: np.ndarray, line: DetectionLine, width: int, height: int):
+        x1 = int(line.x1 * width)
+        y1 = int(line.y1 * height)
+        x2 = int(line.x2 * width)
+        y2 = int(line.y2 * height)
+
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        mid_x = (x1 + x2) // 2
+        mid_y = (y1 + y2) // 2
+        cv2.putText(frame, line.name, (mid_x + 10, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return frame
+
+    @staticmethod
+    def draw_stats(frame: np.ndarray, stats: Dict, counter: TrafficCounter, frame_idx: int, fps: float,
+                   class_stats: Dict):
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (450, 250), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        y_offset = 40
+        texts = [
+            f"Frame: {frame_idx}",
+            f"Active Vehicles: {stats['active_vehicles']}",
+            f"Violations: {stats['total_violations']}",
+            f"Lighting: {enhancer.get_lighting_info(frame)}",
+            f"FPS: {fps:.1f}"
+        ]
+
+        # 添加各类别统计
+        for cls, count in class_stats.items():
+            texts.append(f"{cls}: {count}")
+
+        for text in texts:
+            cv2.putText(frame, text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            y_offset += 25
+
+        # 流量统计
+        y_offset += 10
+        for line_name, counts in stats['counts'].items():
+            text = f"{line_name}: In={counts['in']} Out={counts['out']}"
+            cv2.putText(frame, text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            y_offset += 20
+
+        return frame
+
+
+visualizer = ResultVisualizer()
+
+
+# ============ 任务状态管理（保持原有） ============
+
+def update_task_status(task_id: str, status: str, progress: int, message: str,
+                       result: Optional[Dict] = None, error: Optional[str] = None):
+    data = {
+        'status': status,
+        'progress': progress,
+        'message': message,
+        'update_time': time.time()
+    }
+    if result:
+        data['result'] = json.dumps(result)
+    if error:
+        data['error'] = error
+
+    if redis_client:
+        redis_client.hset(f"task:{task_id}", mapping=data)
+        redis_client.expire(f"task:{task_id}", 86400)
+    else:
+        memory_storage[task_id] = data
+
+
+def get_task_status(task_id: str) -> Optional[Dict]:
+    if redis_client:
+        return redis_client.hgetall(f"task:{task_id}") or None
+    return memory_storage.get(task_id)
+
+
+# ============ 核心视频处理任务（优化版） ============
+
+def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
+                       detection_lines: Optional[List[Dict]] = None):
+    """处理视频（整合开题报告所有优化点）"""
+    cap = None
+    out = None
+    is_cancelled = False
+    temp_output = None
+
+    # 重置跟踪器状态（每视频独立）
+    global tracker, interpolator
+    tracker.reset()
+    interpolator.reset()
+
+    # ✅ 新增：初始化静止过滤器
+    static_filter = StaticObjectFilter(min_displacement=40, min_history=5)
+
+
+    try:
+        logger.info(f"任务 {task_id}: 开始处理 {video_path}")
+        update_task_status(task_id, "processing", 5, "初始化视频...")
+
+        # 解析检测线（保持原有逻辑）
+        lines_data = []
+        if detection_lines and isinstance(detection_lines, list):
+            lines_data = detection_lines
+        elif detection_lines and isinstance(detection_lines, str):
+            try:
+                lines_data = json.loads(detection_lines)
+            except:
+                logger.warning("解析detection_lines失败")
+
+        if not lines_data:
+            lines_data = [{'name': 'main_line', 'x1': 0.5, 'y1': 0.0, 'x2': 0.5, 'y2': 1.0, 'direction': 'vertical'}]
+
+        validated_lines = [x for x in (parse_detection_line(line) for line in lines_data) if x is not None]
+        if not validated_lines:
+            validated_lines = [default_vertical_line()]
+
+        # 打开视频
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"无法打开视频: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # 输出路径
+        final_output = config.RESULTS_DIR / f"{task_id}_result.mp4"
+        temp_output = config.RESULTS_DIR / f"{task_id}_temp.mp4"
+
+        if final_output.exists(): final_output.unlink()
+        if temp_output.exists(): temp_output.unlink()
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(temp_output), fourcc, fps / frame_skip, (width, height))
+
+        lines = validated_lines
+        counter = TrafficCounter(lines, width, height, fps, config.METERS_PER_PIXEL)
+
+        frame_results = []
+        frame_count = 0
+        processed_count = 0
+        total_detections = 0
+        class_stats = {'car': 0, 'bus': 0, 'van': 0, 'others': 0}
+
+        update_task_status(task_id, "processing", 10, "开始分析...")
+
+        while True:
+            if task_id not in active_tasks:
+                is_cancelled = True
+                break
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+            if frame_count % frame_skip != 0:
+                continue
+
+            timestamp = frame_count / fps
+
+            # ===== 优化点1: 图像增强 =====
+            process_frame = enhancer.enhance(frame)
+
+            # ===== 优化点2: 自适应阈值 =====
+            adaptive_conf = enhancer.get_adaptive_confidence(frame, config.CONF_THRESHOLD)
+            if hasattr(detector, 'conf_threshold'):
+                detector.conf_threshold = adaptive_conf
+
+            # 检测
+            try:
+                detections, infer_time = detector.predict(process_frame)
+
+                # ✅ 检测级过滤：置信度 + 面积 + 边缘过滤
+                h, w = frame.shape[:2]
+                frame_area = h * w
+                margin = min(w, h) * 0.08  # 边缘 8% 区域
+                filtered_dets = []
+                for d in detections:
+                    score = d['score']
+                    bbox = d['bbox']
+                    bw = bbox[2] - bbox[0]
+                    bh = bbox[3] - bbox[1]
+                    box_area = bw * bh
+                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+
+                    # 1. 置信度
+                    if score < config.CONF_THRESHOLD:
+                        continue
+                    # 2. 面积：过滤巨型框
+                    if box_area > frame_area * 0.08:
+                        continue
+                    # 3. 长宽比
+                    ratio = bw / max(bh, 1)
+                    if ratio > 4.0 or ratio < 0.25:
+                        continue
+                    # 4. 边缘过滤：中心点太靠近边缘的，大概率是假阳性
+                    if cx < margin or cx > w - margin or cy < margin or cy > h - margin:
+                        continue
+
+                    filtered_dets.append(d)
+                detections = filtered_dets
+
+                # ⚠️ 核心修复：tracker.update 只调用一次！
+                tracks = tracker.update(detections, frame)
+
+                # 跟踪后过滤：杀掉长期静止的背景轨迹
+                tracks = static_filter.update(tracks)
+            except Exception as e:
+                logger.error(f"检测失败帧 {frame_count}: {e}")
+                detections = []
+                infer_time = 0
+                tracks = []
+
+            total_detections += len(detections)
+            for det in detections:
+                cls = det.get('class_name', 'unknown')
+                if cls in class_stats:
+                    class_stats[cls] += 1
+
+            # === 修改：分离 confirmed / tentative，tentative 不进入插值和统计 ===
+            confirmed_tracks = [t for t in tracks if t.get('status') == 'confirmed']
+            tentative_tracks = [t for t in tracks if t.get('status') == 'tentative']
+            confirmed_ids = {t['track_id'] for t in confirmed_tracks}
+
+            # 只对 confirmed 轨迹插值，避免幽灵框被固化
+            if config.ENABLE_INTERPOLATION and confirmed_tracks:
+                confirmed_tracks = interpolator.update(confirmed_tracks, frame_count, confirmed_ids)
+
+            # 合并用于可视化（tentative 显示灰色，但不参与流量统计）
+            all_tracks = confirmed_tracks + tentative_tracks
+
+            # 流量统计只对 confirmed，杜绝假阳性被计入
+            stats = counter.update(confirmed_tracks, frame_count, timestamp)
+
+            # 可视化
+            vis_frame = frame.copy()
+            for line in lines:
+                visualizer.draw_detection_line(vis_frame, line, width, height)
+            for track in confirmed_tracks:
+                visualizer.draw_detection(vis_frame, track)
+
+            out.write(vis_frame)
+
+            # 保存结果
+            frame_data = {
+                'frame': frame_count,
+                'timestamp': round(timestamp, 2),
+                'count': len(detections),
+                'tracks': tracks,
+                'traffic_stats': stats,
+                'infer_ms': round(infer_time * 1000, 1)
+            }
+            frame_results.append(frame_data)
+            processed_count += 1
+
+            # 更新进度
+            if processed_count % 30 == 0:
+                if task_id not in active_tasks:
+                    is_cancelled = True
+                    break
+                progress = min(95, int(frame_count / total_frames * 100)) if total_frames > 0 else 0
+                update_task_status(task_id, "processing", progress,
+                                   f"处理中... {frame_count}/{total_frames}帧 | 光照: {enhancer.get_lighting_info(frame)}")
+
+        # 释放资源
+        if out: out.release(); out = None
+        if cap: cap.release(); cap = None
+
+        if is_cancelled:
+            logger.info(f"任务 {task_id}: 已取消")
+            if temp_output.exists(): temp_output.unlink()
+            return
+
+        # FFmpeg转码（保持原有）
+        if temp_output.exists() and temp_output.stat().st_size > 0:
+            update_task_status(task_id, "processing", 96, "转码中...")
+            ffmpeg_cmd = r"D:\ffmpeg\ffmpeg-8.1-essentials_build\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+
+            if Path(ffmpeg_cmd).exists():
+                try:
+                    cmd = [
+                        ffmpeg_cmd, '-i', str(temp_output),
+                        '-vcodec', 'libx264', '-pix_fmt', 'yuv420p',
+                        '-preset', 'fast', '-crf', '23',
+                        '-movflags', '+faststart', '-an', '-y',
+                        str(final_output)
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    if result.returncode == 0 and final_output.exists():
+                        temp_output.unlink(missing_ok=True)
+                    else:
+                        temp_output.rename(final_output)
+                except Exception as e:
+                    logger.error(f"FFmpeg失败: {e}")
+                    temp_output.rename(final_output)
+            else:
+                temp_output.rename(final_output)
+
+        # 验证输出
+        if not final_output.exists() or final_output.stat().st_size == 0:
+            raise ValueError("视频生成失败")
+
+        # 汇总结果
+        avg_cars = round(total_detections / max(processed_count, 1), 4)
+        final_result = {
+            'video_info': {
+                'total_frames': frame_count, 'fps': fps / frame_skip,
+                'duration_sec': round(frame_count / fps, 1),
+                'width': width, 'height': height
+            },
+            'statistics': {
+                'total_detections': total_detections,
+                'processed_frames': processed_count,
+                'avg_cars_per_frame': avg_cars,
+                'unique_vehicles': len(counter.track_classes),
+                'traffic_counts': counter.counts,
+                'class_distribution': class_stats,
+                'speed_estimation': counter.speed_summary(),
+                'violations': {
+                    'total': len(counter.violations),
+                    'details': counter.violations[:50]
+                }
+            },
+            'output_files': {
+                'result_video': str(final_output),
+                'result_video_url': f"/api/analyze/video/{task_id}"
+            },
+            'frame_results': frame_results[:100]
+        }
+
+        update_task_status(task_id, "completed", 100, "分析完成！", result=final_result)
+        logger.info(f"任务 {task_id}: 完成 | 类别统计: {class_stats} | 违规: {len(counter.violations)}")
+
+    except Exception as e:
+        logger.error(f"任务 {task_id} 失败: {str(e)}")
+        update_task_status(task_id, "failed", -1, f"失败: {str(e)}", error=str(e))
+        is_cancelled = True
+
+    finally:
+        if out: out.release()
+        if cap: cap.release()
+        if temp_output and temp_output.exists():
+            try:
+                temp_output.unlink()
+            except:
+                pass
+        if task_id in active_tasks: del active_tasks[task_id]
+        try:
+            if video_path.exists(): video_path.unlink()
+        except Exception as e:
+            logger.warning(f"清理输入文件失败: {e}")
+
+
+# ============ API端点（保持与原有完全一致，后端无需修改） ============
+
+@app.post("/api/analyze/upload")
+async def upload_video(
+        background_tasks: BackgroundTasks,
+        task_id: str = Form(...),
+        file: UploadFile = File(...),
+        frame_skip: int = Form(3),
+        detection_lines: Optional[str] = Form(None)
+):
+    """上传视频（接口保持不变）"""
+    try:
+        allowed = {'.mp4', '.avi', '.mov', '.mkv'}
+        ext = Path(file.filename or "unknown.mp4").suffix.lower()
+        if ext not in allowed:
+            raise HTTPException(400, f"不支持的格式: {ext}")
+
+        if frame_skip < 1 or frame_skip > 10:
+            raise HTTPException(400, "frame_skip必须在1-10之间")
+
+        temp_dir = config.UPLOAD_DIR
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        video_path = temp_dir / f"{task_id}{ext}"
+
+        active_tasks[task_id] = {
+            "status": "processing", "start_time": time.time(),
+            "video_path": str(video_path)
+        }
+
+        with open(video_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        lines = None
+        if detection_lines:
+            try:
+                lines = json.loads(detection_lines)
+            except:
+                raise HTTPException(400, "detection_lines格式错误")
+
+        update_task_status(task_id, "pending", 0, "等待处理")
+        background_tasks.add_task(process_video_task, task_id, video_path, frame_skip, lines)
+
+        return JSONResponse({
+            "code": 200, "message": "上传成功，开始分析",
+            "data": {
+                "task_id": task_id, "status": "processing",
+                "check_url": f"/api/analyze/result/{task_id}",
+                "video_url": f"/api/analyze/video/{task_id}"
+            }
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"上传失败: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/analyze/result/{task_id}")
+async def get_result(task_id: str):
+    """查询结果（接口保持不变）"""
+    try:
+        task_data = get_task_status(task_id)
+        if not task_data:
+            return JSONResponse({"code": 404, "message": "任务不存在", "data": None})
+
+        result = None
+        if task_data.get('result'):
+            try:
+                result = json.loads(task_data['result']) if isinstance(task_data['result'], str) else task_data[
+                    'result']
+            except:
+                result = task_data['result']
+
+        return JSONResponse({
+            "code": 200,
+            "data": {
+                "task_id": task_id,
+                "status": task_data.get('status'),
+                "progress": int(task_data.get('progress', 0)),
+                "message": task_data.get('message'),
+                "result": result,
+                "error": task_data.get('error')
+            }
+        })
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.api_route("/api/analyze/video/{task_id}", methods=["GET", "HEAD"])
+async def get_result_video(task_id: str, request: Request, download: bool = False):
+    """获取视频（接口保持不变）"""
+    try:
+        video_path = config.RESULTS_DIR / f"{task_id}_result.mp4"
+
+        if not video_path.exists():
+            task_data = get_task_status(task_id)
+            if not task_data: raise HTTPException(404, "任务不存在")
+            status = task_data.get('status')
+            if status == 'processing':
+                raise HTTPException(202, "处理中")
+            elif status == 'failed':
+                raise HTTPException(500, "处理失败")
+            else:
+                raise HTTPException(404, "视频不存在")
+
+        if request.method == "HEAD":
+            return Response(headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(video_path.stat().st_size),
+                "Accept-Ranges": "bytes"
+            })
+
+        if download:
+            return FileResponse(video_path, media_type="video/mp4", filename=f"{task_id}_result.mp4")
+        else:
+            return FileResponse(video_path, media_type="video/mp4",
+                                headers={"Content-Disposition": f"inline; filename={task_id}_result.mp4"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/analyze/videos")
+async def list_result_videos():
+    """列出所有结果视频"""
+    try:
+        videos = []
+        for video_file in config.RESULTS_DIR.glob("*_result.mp4"):
+            task_id = video_file.stem.replace("_result", "")
+            stat = video_file.stat()
+            videos.append({
+                "task_id": task_id, "filename": video_file.name,
+                "size": stat.st_size,
+                "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                "url": f"/api/analyze/video/{task_id}"
+            })
+        return JSONResponse({"code": 200, "data": {"total": len(videos),
+                                                   "videos": sorted(videos, key=lambda x: x['created'], reverse=True)}})
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/analyze/video/{task_id}")
+async def delete_result_video(task_id: str):
+    """删除视频"""
+    try:
+        video_path = config.RESULTS_DIR / f"{task_id}_result.mp4"
+        if video_path.exists():
+            video_path.unlink()
+            return JSONResponse({"code": 200, "message": "已删除"})
+        raise HTTPException(404, "视频不存在")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/analyze/frame")
+async def analyze_single_frame(file: UploadFile = File(...)):
+    """单帧检测（接口保持不变）"""
+    try:
+        allowed = {'.jpg', '.jpeg', '.png', '.bmp'}
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in allowed: raise HTTPException(400, f"不支持的格式: {ext}")
+
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None: raise HTTPException(400, "无法读取图片")
+
+        h, w = frame.shape[:2]
+
+        # 增强预处理
+        process_frame = enhancer.enhance(frame)
+        adaptive_conf = enhancer.get_adaptive_confidence(frame, config.CONF_THRESHOLD)
+        if hasattr(detector, 'conf_threshold'):
+            detector.conf_threshold = adaptive_conf
+
+        start = time.time()
+        detections, _ = detector.predict(process_frame)
+        infer_time = time.time() - start
+
+        # 绘制（保持与原有相同的颜色定义）
+        colors = {'car': (0, 255, 0), 'bus': (255, 165, 0), 'van': (0, 0, 255), 'others': (128, 128, 128)}
+        vis_frame = frame.copy()
+        detection_results = []
+
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = map(int, det['bbox'])
+            cls = det['class_name']
+            score = det['score']
+            color = colors.get(cls, (128, 128, 128))
+
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls} {score:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(vis_frame, (x1, y1 - th - 10), (x1 + tw, y1), color, -1)
+            cv2.putText(vis_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            detection_results.append({
+                'id': i + 1, 'class': cls, 'score': round(score, 3),
+                'bbox': [x1, y1, x2, y2]
+            })
+
+        class_counts = {}
+        for d in detection_results:
+            cls = d['class']
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+
+        info_text = f"Total: {len(detections)} | " + " ".join([f"{k}:{v}" for k, v in class_counts.items()])
+        cv2.putText(vis_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        _, buffer = cv2.imencode('.jpg', vis_frame)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        return JSONResponse({
+            "code": 200,
+            "data": {
+                "count": len(detections),
+                "detections": detection_results,
+                "infer_time_ms": round(infer_time * 1000, 1),
+                "image_width": w, "image_height": h,
+                "marked_image": f"data:image/jpeg;base64,{img_base64}",
+                "statistics": {"total": len(detections), "by_class": class_counts}
+            }
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"单帧检测失败: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/analyze/cancel/{task_id}")
+async def cancel_task(task_id: str):
+    """取消任务"""
+    if task_id in active_tasks:
+        del active_tasks[task_id]
+        update_task_status(task_id, "cancelled", -1, "用户已取消")
+        return {"success": True}
+    return {"success": False, "message": "任务不存在"}
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "model": "rtdetr_detrac_4class" if model_loaded else "simulator",
+        "enhancements": {
+            "appearance_feature": config.ENABLE_APPEARANCE,
+            "trajectory_interpolation": config.ENABLE_INTERPOLATION,
+            "image_enhancement": config.ENABLE_ENHANCEMENT
+        },
+        "version": "3.1.0-optimized"
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    logger.info("=" * 50)
+    logger.info("启动优化版AI服务")
+    logger.info(
+        f"增强功能: 外观特征={config.ENABLE_APPEARANCE}, 插值={config.ENABLE_INTERPOLATION}, 图像增强={config.ENABLE_ENHANCEMENT}")
+    logger.info("=" * 50)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

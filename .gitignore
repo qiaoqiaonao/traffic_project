@@ -1,0 +1,10 @@
+# 项目特有
+dataset/
+logs/
+output/
+results/
+status_backup/
+temp/uploads/
+
+# 如果 .idea 想完全忽略也加上
+.idea/
