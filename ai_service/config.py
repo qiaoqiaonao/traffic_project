@@ -44,6 +44,8 @@ class Config:
     MAX_BOXES: int = 50
 
     # 车速估算：像素→米的近似标定（需按摄像头/场景标定，论文中可说明为经验参数）
+    # 车速估算：像素→米的近似标定
+    # 高空俯拍路口场景建议 0.10~0.15；近距离路侧监控建议 0.03~0.05
     METERS_PER_PIXEL: float = 0.05
 
     # 路径配置（均相对 ai_service 目录，避免找不到 uploads/results）

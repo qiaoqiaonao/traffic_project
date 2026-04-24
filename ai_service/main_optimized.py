@@ -244,26 +244,54 @@ class TrafficCounter:
             frame_height: int,
             fps: float,
             meters_per_pixel: float,
+            frame_skip: int = 3
     ):
         self.lines = lines
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.fps = max(fps, 1e-3)
         self.meters_per_pixel = meters_per_pixel
+        self.frame_skip = frame_skip
         self.counts = {line.name: {'in': 0, 'out': 0} for line in lines}
         self.vehicle_history = {}
         self.violations = []
         self.stationary_frames = {}
         self.track_classes = {}
-        self.track_last_pos = {}  # track_id -> (frame_idx, cx, cy)
+        self.track_last_pos = {}          # track_id -> (frame_idx, cx, cy)
+        self.track_speed_history = {}     # track_id -> [speed_mps, ...]  用于超速/违停
+        self.track_velocity_history = {}  # track_id -> [(vx, vy), ...]   用于逆行
         self.speed_samples_mps: List[float] = []
         self._parking_fired = set()
+        self._wrong_direction_fired = set()
+        self._speeding_fired = set()
+
+        # ========== 异常检测参数 ==========
+        # 违停
+        self.parking_duration_sec = 5.0
+        self.parking_frame_threshold = int(self.fps * self.parking_duration_sec / self.frame_skip)
+        self.parking_speed_threshold_mps = 0.8
+        self.parking_min_movement_mps = 2.0
+
+        # 逆行
+        self.wrong_direction_min_speed_mps = 1.5
+
+        # 超速：路口场景 80 km/h，中位数滤波，最少5样本/15帧
+        self.speed_limit_mps = 80.0 / 3.6
+        self.speeding_min_history = 5
+        self.speeding_min_track_frames = 15
+        self.speeding_max_valid_mps = 100.0 / 3.6
+
+        # 拥堵
+        self.congestion_vehicle_threshold = 8
+        self.congestion_speed_threshold_mps = 3.0
+        self.congestion_distance_px = 200
 
     def update(self, tracks: List[Dict], frame_idx: int, timestamp: float):
         current_tracks = {}
         frame_diag = math.hypot(self.frame_width, self.frame_height)
         still_px = max(5.0, 0.002 * frame_diag)
 
+        track_data = {}
         for track in tracks:
             track_id = track['track_id']
             bbox = track['bbox']
@@ -283,19 +311,54 @@ class TrafficCounter:
             if track.get('is_interpolated', False):
                 continue
 
-            # 车速（相邻采样帧位移 / 时间）
+            # ===== 速度计算 =====
+            velocity = (0.0, 0.0)
+            speed_mps = 0.0
             if track_id in self.track_last_pos:
                 pf, px, py = self.track_last_pos[track_id]
                 dt = (frame_idx - pf) / self.fps
                 if dt > 1e-6:
-                    dpx = math.hypot(center[0] - px, center[1] - py)
-                    v_mps = dpx * self.meters_per_pixel / dt
-                    if v_mps < 55:  # 过滤异常跳变（约 200km/h）
-                        self.speed_samples_mps.append(v_mps)
-            self.track_last_pos[track_id] = (frame_idx, center[0], center[1])
+                    dx = center[0] - px
+                    dy = center[1] - py
+                    velocity = (dx / dt, dy / dt)
+                    speed_mps = math.hypot(dx, dy) * self.meters_per_pixel / dt
 
+                    # 只保留合理速度（0 ~ 100km/h）的样本
+                    if 0 < speed_mps < self.speeding_max_valid_mps:
+                        if track_id not in self.track_speed_history:
+                            self.track_speed_history[track_id] = []
+                        self.track_speed_history[track_id].append(speed_mps)
+                        if len(self.track_speed_history[track_id]) > 5:
+                            self.track_speed_history[track_id].pop(0)
+                        self.speed_samples_mps.append(speed_mps)
+
+                        # 同时记录速度向量（用于逆行判断）
+                        if track_id not in self.track_velocity_history:
+                            self.track_velocity_history[track_id] = []
+                        self.track_velocity_history[track_id].append(velocity)
+                        if len(self.track_velocity_history[track_id]) > 10:
+                            self.track_velocity_history[track_id].pop(0)
+
+            self.track_last_pos[track_id] = (frame_idx, center[0], center[1])
+            track_data[track_id] = {
+                'center': center,
+                'velocity': velocity,
+                'speed_mps': speed_mps,
+                'class': class_name,
+                'bbox': bbox
+            }
+
+            # 违停检测
+            self._check_parking(track_id, center, speed_mps, frame_idx, timestamp, still_px)
+
+            # 超速检测
+            self._check_speeding(track_id, center, frame_idx, timestamp)
+
+        # 检测线穿越（流量统计 + 逆行）
+        for track_id, data in track_data.items():
             if track_id in self.vehicle_history:
                 last_pos = self.vehicle_history[track_id]['center']
+                center = data['center']
 
                 for line in self.lines:
                     line_px = (
@@ -319,41 +382,13 @@ class TrafficCounter:
                             self.counts[line.name][f'{vehicle_type}_out'] += 1
 
                             if line.one_way:
-                                self.violations.append({
-                                    'type': 'wrong_direction',
-                                    'track_id': track_id,
-                                    'vehicle_type': vehicle_type,
-                                    'timestamp': timestamp,
-                                    'frame': frame_idx,
-                                    'location': [float(center[0]), float(center[1])],
-                                    'line': line.name,
-                                    'reason': 'one_way_out',
-                                })
+                                self._check_wrong_direction(
+                                    track_id, center, line, line_px,
+                                    frame_idx, timestamp, vehicle_type
+                                )
 
-            if track_id in self.stationary_frames:
-                info = self.stationary_frames[track_id]
-                dx = center[0] - info['position'][0]
-                dy = center[1] - info['position'][1]
-                distance = math.hypot(dx, dy)
-
-                if distance < still_px:
-                    info['frames'] += 1
-                    if info['frames'] > 90 and track_id not in self._parking_fired:
-                        self.violations.append({
-                            'type': 'illegal_parking',
-                            'track_id': track_id,
-                            'vehicle_type': class_name,
-                            'timestamp': timestamp,
-                            'frame': frame_idx,
-                            'location': [float(center[0]), float(center[1])],
-                        })
-                        self._parking_fired.add(track_id)
-                        info['frames'] = 0
-                else:
-                    info['position'] = center
-                    info['frames'] = 0
-            else:
-                self.stationary_frames[track_id] = {'position': center, 'frames': 0}
+        # 拥堵检测
+        self._check_congestion(track_data, frame_idx, timestamp)
 
         self.vehicle_history = current_tracks
 
@@ -362,6 +397,176 @@ class TrafficCounter:
             'active_vehicles': len(current_tracks),
             'total_violations': len(self.violations)
         }
+
+    # ========== 违停 ==========
+    def _check_parking(self, track_id, center, speed_mps, frame_idx, timestamp, still_px):
+        if track_id not in self.stationary_frames:
+            self.stationary_frames[track_id] = {
+                'position': center,
+                'frames': 0,
+                'start_frame': frame_idx,
+                'last_moving_frame': frame_idx if speed_mps > self.parking_speed_threshold_mps else None
+            }
+            return
+
+        info = self.stationary_frames[track_id]
+        dx = center[0] - info['position'][0]
+        dy = center[1] - info['position'][1]
+        distance = math.hypot(dx, dy)
+
+        is_stationary = (speed_mps < self.parking_speed_threshold_mps) or (distance < still_px)
+
+        if is_stationary:
+            info['frames'] += 1
+        else:
+            info['position'] = center
+            info['frames'] = 0
+            info['start_frame'] = frame_idx
+            info['last_moving_frame'] = frame_idx
+
+        if (info['frames'] > self.parking_frame_threshold and
+                track_id not in self._parking_fired):
+
+            has_moved = False
+            if track_id in self.track_speed_history and len(self.track_speed_history[track_id]) > 0:
+                max_speed = max(self.track_speed_history[track_id])
+                has_moved = max_speed > self.parking_min_movement_mps
+
+            near_line = self._is_near_any_line(center, margin=100)
+
+            if has_moved and not near_line:
+                duration_sec = info['frames'] * self.frame_skip / self.fps
+                self.violations.append({
+                    'type': 'illegal_parking',
+                    'track_id': track_id,
+                    'vehicle_type': self.track_classes.get(track_id, 'car'),
+                    'timestamp': timestamp,
+                    'frame': frame_idx,
+                    'location': [float(center[0]), float(center[1])],
+                    'duration_sec': round(duration_sec, 1),
+                    'reason': 'stationary_timeout'
+                })
+                self._parking_fired.add(track_id)
+
+    # ========== 逆行 ==========
+    def _check_wrong_direction(self, track_id, center, line, line_px, frame_idx, timestamp, vehicle_type):
+        if track_id not in self.track_velocity_history:
+            return
+        if len(self.track_velocity_history[track_id]) < 2:
+            return
+        if track_id in self._wrong_direction_fired:
+            return
+
+        recent_v = self.track_velocity_history[track_id][-3:]
+        avg_vx = sum(v[0] for v in recent_v) / len(recent_v)
+        avg_vy = sum(v[1] for v in recent_v) / len(recent_v)
+        avg_speed_mps = math.hypot(avg_vx, avg_vy) * self.meters_per_pixel
+
+        if avg_speed_mps < self.wrong_direction_min_speed_mps:
+            return
+
+        road_dx = line_px[2] - line_px[0]
+        road_dy = line_px[3] - line_px[1]
+        dot = avg_vx * road_dx + avg_vy * road_dy
+        if dot < 0:
+            self.violations.append({
+                'type': 'wrong_direction',
+                'track_id': track_id,
+                'vehicle_type': vehicle_type,
+                'timestamp': timestamp,
+                'frame': frame_idx,
+                'location': [float(center[0]), float(center[1])],
+                'line': line.name,
+                'reason': 'direction_opposite',
+                'speed_kmh': round(avg_speed_mps * 3.6, 1)
+            })
+            self._wrong_direction_fired.add(track_id)
+
+    # ========== 超速（中位数滤波） ==========
+    def _check_speeding(self, track_id, center, frame_idx, timestamp):
+        if track_id in self._speeding_fired:
+            return
+
+        history = self.track_speed_history.get(track_id, [])
+        if len(history) < self.speeding_min_history:
+            return
+
+        tracked_frames = len(history) * self.frame_skip
+        if tracked_frames < self.speeding_min_track_frames:
+            return
+
+        sorted_hist = sorted(history)
+        avg_speed = sorted_hist[len(sorted_hist) // 2]
+
+        if avg_speed <= self.speed_limit_mps:
+            return
+
+        self.violations.append({
+            'type': 'speeding',
+            'track_id': track_id,
+            'vehicle_type': self.track_classes.get(track_id, 'car'),
+            'timestamp': timestamp,
+            'frame': frame_idx,
+            'location': [float(center[0]), float(center[1])],
+            'speed_kmh': round(avg_speed * 3.6, 1),
+            'speed_limit_kmh': round(self.speed_limit_mps * 3.6, 1)
+        })
+        self._speeding_fired.add(track_id)
+
+    # ========== 拥堵 ==========
+    def _check_congestion(self, track_data, frame_idx, timestamp):
+        if not track_data:
+            return
+
+        for line in self.lines:
+            line_cx = (line.x1 + line.x2) / 2 * self.frame_width
+            line_cy = (line.y1 + line.y2) / 2 * self.frame_height
+
+            nearby = []
+            for tid, data in track_data.items():
+                cx, cy = data['center']
+                dist = math.hypot(cx - line_cx, cy - line_cy)
+                if dist < self.congestion_distance_px:
+                    nearby.append(data)
+
+            if len(nearby) >= self.congestion_vehicle_threshold:
+                avg_speed = sum(d['speed_mps'] for d in nearby) / len(nearby)
+                if avg_speed < self.congestion_speed_threshold_mps:
+                    already = any(
+                        v.get('line') == line.name and v['type'] == 'congestion'
+                        for v in self.violations
+                    )
+                    if not already:
+                        self.violations.append({
+                            'type': 'congestion',
+                            'line': line.name,
+                            'timestamp': timestamp,
+                            'frame': frame_idx,
+                            'vehicle_count': len(nearby),
+                            'avg_speed_kmh': round(avg_speed * 3.6, 1)
+                        })
+
+    def _is_near_any_line(self, center, margin=100):
+        cx, cy = center
+        for line in self.lines:
+            x1 = line.x1 * self.frame_width
+            y1 = line.y1 * self.frame_height
+            x2 = line.x2 * self.frame_width
+            y2 = line.y2 * self.frame_height
+
+            dx = x2 - x1
+            dy = y2 - y1
+            if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+                dist = math.hypot(cx - x1, cy - y1)
+            else:
+                t = max(0.0, min(1.0, ((cx - x1) * dx + (cy - y1) * dy) / (dx * dx + dy * dy)))
+                proj_x = x1 + t * dx
+                proj_y = y1 + t * dy
+                dist = math.hypot(cx - proj_x, cy - proj_y)
+
+            if dist < margin:
+                return True
+        return False
 
     def _crosses_line(self, p1, p2, line):
         def ccw(A, B, C):
@@ -579,7 +784,7 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         out = cv2.VideoWriter(str(temp_output), fourcc, fps / frame_skip, (width, height))
 
         lines = validated_lines
-        counter = TrafficCounter(lines, width, height, fps, config.METERS_PER_PIXEL)
+        counter = TrafficCounter(lines, width, height, fps, config.METERS_PER_PIXEL, frame_skip)
 
         frame_results = []
         frame_count = 0
