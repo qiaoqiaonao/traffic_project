@@ -55,7 +55,8 @@ except ImportError:
 
 
 class RTDETRPredictor:
-    def __init__(self, model_path, use_onnx=None, conf_threshold=0.35, nms_threshold=0.5):
+    def __init__(self, model_path, use_onnx=None, conf_threshold=0.35, nms_threshold=0.5,
+                 num_threads=None):
         self.input_size = 640
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
@@ -73,15 +74,18 @@ class RTDETRPredictor:
             use_onnx = USE_ONNX
 
         if use_onnx and Path(model_path).suffix == '.onnx':
-            self._init_onnx(model_path)
+            self._init_onnx(model_path, num_threads)
         else:
             raise ValueError("当前仅支持ONNX格式")
 
-    def _init_onnx(self, model_path):
+    def _init_onnx(self, model_path, num_threads=None):
         """初始化ONNX Runtime"""
+        import os
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.intra_op_num_threads = 4
+        if num_threads is None or num_threads <= 0:
+            num_threads = os.cpu_count() or 4
+        sess_options.intra_op_num_threads = num_threads
 
         self.session = ort.InferenceSession(
             model_path,
@@ -144,11 +148,14 @@ class RTDETRPredictor:
         y2o = max(0, min(y2o, orig_h))
         return x1o, y1o, x2o, y2o
 
-    def postprocess(self, outputs, orig_size, resized_img):
+    def postprocess(self, outputs, orig_size, resized_img, threshold=None):
         """
         主格式：[class_id, score, x1, y1, x2, y2]（Paddle RT-DETR / UA-DETRAC 常见）。
         含最小面积过滤，抑制小片假阳性。
         """
+        if threshold is None:
+            threshold = self.conf_threshold
+
         orig_h, orig_w = orig_size
         dets = np.asarray(outputs[0])
         aux = outputs[1] if len(outputs) > 1 else None
@@ -170,7 +177,7 @@ class RTDETRPredictor:
             for i in range(dets.shape[0]):
                 cls_id = int(round(float(dets[i, 0])))
                 score = float(dets[i, 1])
-                if score < self.conf_threshold:
+                if score < threshold:
                     continue
                 if cls_id < 0 or cls_id > 3:
                     continue
@@ -190,7 +197,7 @@ class RTDETRPredictor:
         else:
             for i in range(dets.shape[0]):
                 score = float(dets[i, 1])
-                if score < self.conf_threshold:
+                if score < threshold:
                     continue
                 x1, y1, x2, y2 = map(float, dets[i, 2:6])
                 if x2 <= x1 or y2 <= y1:
@@ -257,8 +264,10 @@ class RTDETRPredictor:
 
         return inter_area / (union_area + 1e-6)
 
-    def predict(self, image):
-        """单张图片推理"""
+    def predict(self, image, conf_threshold=None):
+        """单张图片推理，conf_threshold 为 None 时使用实例默认值"""
+        threshold = conf_threshold if conf_threshold is not None else self.conf_threshold
+
         input_tensor, orig_size, resized_img = self.preprocess(image)
 
         im_shape = np.array([[self.input_size, self.input_size]], dtype=np.float32)
@@ -279,7 +288,7 @@ class RTDETRPredictor:
         outputs = self.session.run(self.output_names, input_feed)
         inference_time = time.time() - start
 
-        detections = self.postprocess(outputs, orig_size, resized_img)
+        detections = self.postprocess(outputs, orig_size, resized_img, threshold)
 
         # 这行现在只写入日志文件，不显示在控制台
         logger.info(f"检测到 {len(detections)} 个目标")

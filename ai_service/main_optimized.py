@@ -8,23 +8,20 @@
 # ai_service/main_optimized.py
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
+import threading
 import cv2
 import numpy as np
 import json
 import time
 import base64
-from io import BytesIO
-import shutil
-import uuid
 import redis
 import logging
+import math
+import subprocess
 from typing import List, Optional, Dict
 from datetime import datetime
-import subprocess
-import sys
-import math
 
 # 导入优化模块
 from config import config
@@ -32,10 +29,6 @@ from enhanced_tracker import EnhancedDeepSORT
 from trajectory_interpolator import TrajectoryInterpolator
 from image_enhancement import ImageEnhancer
 from detection_line import DetectionLine, parse_detection_line, default_vertical_line
-import logging
-from pathlib import Path
-
-import math
 
 class StaticObjectFilter:
     """
@@ -166,6 +159,8 @@ except Exception as e:
 
 memory_storage = {}
 active_tasks = {}
+_storage_lock = threading.Lock()
+_tasks_lock = threading.Lock()
 
 # ============ 初始化核心组件 ============
 
@@ -179,13 +174,14 @@ if not _model_file.is_file():
 
 # 初始化检测器（保持原有逻辑，从test_inference_new导入）
 try:
-    from test_inference_new import RTDETRPredictor
+    from ai_service.test_inference_new import RTDETRPredictor
 
     detector = RTDETRPredictor(
         config.MODEL_PATH,
         use_onnx=True,
         conf_threshold=config.CONF_THRESHOLD,
-        nms_threshold=config.NMS_THRESHOLD
+        nms_threshold=config.NMS_THRESHOLD,
+        num_threads=config.ONNX_NUM_THREADS
     )
     logger.info("✅ RT-DETR模型加载成功")
     model_loaded = True
@@ -267,24 +263,26 @@ class TrafficCounter:
 
         # ========== 异常检测参数 ==========
         # 违停
-        self.parking_duration_sec = 5.0
-        self.parking_frame_threshold = int(self.fps * self.parking_duration_sec / self.frame_skip)
-        self.parking_speed_threshold_mps = 0.8
-        self.parking_min_movement_mps = 2.0
+        self.parking_duration_sec = 3.0
+        self.parking_frame_threshold = max(10, int(self.fps * self.parking_duration_sec / self.frame_skip))
+        self.parking_speed_threshold_mps = 1.0
+        self.parking_min_movement_mps = 1.5
 
-        # 逆行
-        self.wrong_direction_min_speed_mps = 1.5
+        # 逆行：不依赖 one_way，任何反向穿越都检测
+        self.wrong_direction_min_speed_mps = 1.0
 
-        # 超速：路口场景 80 km/h，中位数滤波，最少5样本/15帧
-        self.speed_limit_mps = 80.0 / 3.6
-        self.speeding_min_history = 5
-        self.speeding_min_track_frames = 15
-        self.speeding_max_valid_mps = 100.0 / 3.6
+        # 超速：默认 60 km/h，可通过环境变量覆盖
+        import os
+        speed_limit_kmh = float(os.environ.get("SPEED_LIMIT_KMH", "60"))
+        self.speed_limit_mps = speed_limit_kmh / 3.6
+        self.speeding_min_history = 3
+        self.speeding_min_track_frames = 9
+        self.speeding_max_valid_mps = 120.0 / 3.6
 
         # 拥堵
-        self.congestion_vehicle_threshold = 8
-        self.congestion_speed_threshold_mps = 3.0
-        self.congestion_distance_px = 200
+        self.congestion_vehicle_threshold = 5
+        self.congestion_speed_threshold_mps = 4.0
+        self.congestion_distance_px = 300
 
     def update(self, tracks: List[Dict], frame_idx: int, timestamp: float):
         current_tracks = {}
@@ -331,6 +329,8 @@ class TrafficCounter:
                         if len(self.track_speed_history[track_id]) > 5:
                             self.track_speed_history[track_id].pop(0)
                         self.speed_samples_mps.append(speed_mps)
+                        if len(self.speed_samples_mps) > 10000:
+                            del self.speed_samples_mps[:5000]  # 保留后一半
 
                         # 同时记录速度向量（用于逆行判断）
                         if track_id not in self.track_velocity_history:
@@ -381,16 +381,20 @@ class TrafficCounter:
                             self.counts[line.name].setdefault(f'{vehicle_type}_out', 0)
                             self.counts[line.name][f'{vehicle_type}_out'] += 1
 
-                            if line.one_way:
-                                self._check_wrong_direction(
-                                    track_id, center, line, line_px,
-                                    frame_idx, timestamp, vehicle_type
-                                )
+                            # 逆行检测：对 one_way 线路直接检查；对普通线路也检查速度方向
+                            self._check_wrong_direction(
+                                track_id, center, line, line_px,
+                                frame_idx, timestamp, vehicle_type
+                            )
 
         # 拥堵检测
         self._check_congestion(track_data, frame_idx, timestamp)
 
         self.vehicle_history = current_tracks
+
+        # 每 300 帧清理一次过期历史数据，防止内存膨胀
+        if frame_idx % 300 == 0:
+            self._gc_stale_tracks(current_tracks)
 
         return {
             'counts': self.counts,
@@ -491,9 +495,12 @@ class TrafficCounter:
         if len(history) < self.speeding_min_history:
             return
 
-        tracked_frames = len(history) * self.frame_skip
-        if tracked_frames < self.speeding_min_track_frames:
-            return
+        # 用 real-time dt 校验而不是 frame_skip * count，避免全帧/跳1帧时永远不触发
+        if track_id in self.track_last_pos:
+            first_frame = self.track_last_pos[track_id][0]  # 该 track 第一次记录的真实帧号
+            tracked_seconds = (frame_idx - first_frame) / self.fps
+            if tracked_seconds < 0.3:  # 至少持续 0.3 秒
+                return
 
         sorted_hist = sorted(history)
         avg_speed = sorted_hist[len(sorted_hist) // 2]
@@ -567,6 +574,15 @@ class TrafficCounter:
             if dist < margin:
                 return True
         return False
+
+    def _gc_stale_tracks(self, current_tracks):
+        """清理已消失 track 在各 history dict 中的残留数据"""
+        active_ids = set(current_tracks.keys())
+        for storage in (self.track_last_pos, self.track_speed_history,
+                         self.track_velocity_history, self.stationary_frames):
+            stale = [tid for tid in storage if tid not in active_ids]
+            for tid in stale:
+                del storage[tid]
 
     def _crosses_line(self, p1, p2, line):
         def ccw(A, B, C):
@@ -714,19 +730,22 @@ def update_task_status(task_id: str, status: str, progress: int, message: str,
         redis_client.hset(f"task:{task_id}", mapping=data)
         redis_client.expire(f"task:{task_id}", 86400)
     else:
-        memory_storage[task_id] = data
+        with _storage_lock:
+            memory_storage[task_id] = data
 
 
 def get_task_status(task_id: str) -> Optional[Dict]:
     if redis_client:
         return redis_client.hgetall(f"task:{task_id}") or None
-    return memory_storage.get(task_id)
+    with _storage_lock:
+        return memory_storage.get(task_id)
 
 
 # ============ 核心视频处理任务（优化版） ============
 
 def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
-                       detection_lines: Optional[List[Dict]] = None):
+                       detection_lines: Optional[List[Dict]] = None,
+                       meters_per_pixel: float = 0.05):
     """处理视频（整合开题报告所有优化点）"""
     cap = None
     out = None
@@ -783,20 +802,60 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(str(temp_output), fourcc, fps / frame_skip, (width, height))
 
+        # ===== 实时HLS流输出 =====
+        hls_dir = config.RESULTS_DIR / f"{task_id}_hls"
+        hls_dir.mkdir(parents=True, exist_ok=True)
+        for f in hls_dir.glob("*"): f.unlink()
+        hls_proc = None
+        hls_ffmpeg_ok = False
+        try:
+            # 检查FFmpeg可用性
+            check = subprocess.run([config.FFMPEG_PATH, '-version'], capture_output=True, timeout=5)
+            if check.returncode != 0:
+                raise RuntimeError(f"FFmpeg不可用: {check.stderr.decode(errors='replace')}")
+            hls_ffmpeg_ok = True
+        except Exception as e:
+            logger.error(f"HLS无法启动: FFmpeg检查失败 - {e}")
+
+        if hls_ffmpeg_ok:
+            try:
+                hls_log = open(hls_dir / "ffmpeg.log", "w")
+                hls_proc = subprocess.Popen([
+                    config.FFMPEG_PATH, '-y',
+                    '-f', 'image2pipe', '-vcodec', 'mjpeg',
+                    '-use_wallclock_as_timestamps', '1',
+                    '-i', 'pipe:0',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                    '-crf', '28', '-g', '10',
+                    '-f', 'hls', '-hls_time', '3', '-hls_list_size', '8',
+                    '-hls_flags', 'delete_segments+omit_endlist',
+                    '-hls_segment_filename', str(hls_dir / 'seg_%03d.ts'),
+                    str(hls_dir / 'stream.m3u8')
+                ], stdin=subprocess.PIPE, stderr=hls_log)
+                logger.info(f"HLS已启动 -> {hls_dir / 'stream.m3u8'}")
+            except Exception as e:
+                logger.error(f"HLS启动失败: {e}")
+                hls_proc = None
+
         lines = validated_lines
-        counter = TrafficCounter(lines, width, height, fps, config.METERS_PER_PIXEL, frame_skip)
+        counter = TrafficCounter(lines, width, height, fps, meters_per_pixel, frame_skip)
 
         frame_results = []
         frame_count = 0
         processed_count = 0
         total_detections = 0
+        last_frame_sent_time = 0.0
         class_stats = {'car': 0, 'bus': 0, 'van': 0, 'others': 0}
 
         update_task_status(task_id, "processing", 10, "开始分析...")
 
         while True:
-            if task_id not in active_tasks:
-                is_cancelled = True
+            with _tasks_lock:
+                if task_id not in active_tasks:
+                    is_cancelled = True
+                    break
+
+            if is_cancelled:
                 break
 
             ret, frame = cap.read()
@@ -812,39 +871,33 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             # ===== 优化点1: 图像增强 =====
             process_frame = enhancer.enhance(frame)
 
-            # ===== 优化点2: 自适应阈值 =====
+            # ===== 优化点2: 自适应阈值（先计算，再传入推理，不修改全局状态） =====
             adaptive_conf = enhancer.get_adaptive_confidence(frame, config.CONF_THRESHOLD)
-            if hasattr(detector, 'conf_threshold'):
-                detector.conf_threshold = adaptive_conf
 
             # 检测
             try:
-                detections, infer_time = detector.predict(process_frame)
+                detections, infer_time = detector.predict(process_frame, conf_threshold=adaptive_conf)
 
-                # ✅ 检测级过滤：置信度 + 面积 + 边缘过滤
+                # ✅ 检测级二次过滤：面积 + 长宽比 + 边缘
                 h, w = frame.shape[:2]
                 frame_area = h * w
                 margin = min(w, h) * 0.08  # 边缘 8% 区域
                 filtered_dets = []
                 for d in detections:
-                    score = d['score']
                     bbox = d['bbox']
                     bw = bbox[2] - bbox[0]
                     bh = bbox[3] - bbox[1]
                     box_area = bw * bh
                     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
 
-                    # 1. 置信度
-                    if score < config.CONF_THRESHOLD:
-                        continue
-                    # 2. 面积：过滤巨型框
+                    # 1. 面积：过滤巨型框（超过画面 8%）
                     if box_area > frame_area * 0.08:
                         continue
-                    # 3. 长宽比
+                    # 2. 长宽比：过滤极端比例
                     ratio = bw / max(bh, 1)
                     if ratio > 4.0 or ratio < 0.25:
                         continue
-                    # 4. 边缘过滤：中心点太靠近边缘的，大概率是假阳性
+                    # 3. 边缘过滤：中心点太靠近边缘的，大概率是假阳性
                     if cx < margin or cx > w - margin or cy < margin or cy > h - margin:
                         continue
 
@@ -892,6 +945,14 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
 
             out.write(vis_frame)
 
+            # HLS实时流：写标注帧到FFmpeg pipe
+            if hls_proc and hls_proc.poll() is None:
+                try:
+                    _, jpeg = cv2.imencode('.jpg', vis_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    hls_proc.stdin.write(jpeg.tobytes())
+                except Exception:
+                    pass
+
             # 保存结果
             frame_data = {
                 'frame': frame_count,
@@ -902,18 +963,38 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
                 'infer_ms': round(infer_time * 1000, 1)
             }
             frame_results.append(frame_data)
+            if len(frame_results) > config.MAX_FRAME_RESULTS:
+                frame_results = frame_results[-config.MAX_FRAME_RESULTS:]
             processed_count += 1
 
-            # 更新进度
+            # 更新进度 + 违规诊断日志
             if processed_count % 30 == 0:
-                if task_id not in active_tasks:
-                    is_cancelled = True
+                with _tasks_lock:
+                    if task_id not in active_tasks:
+                        is_cancelled = True
+                if is_cancelled:
                     break
                 progress = min(95, int(frame_count / total_frames * 100)) if total_frames > 0 else 0
+                # 诊断：输出当前违规统计
+                n_confirmed = len(confirmed_tracks)
+                n_violations = len(counter.violations)
+                v_types = {}
+                for v in counter.violations:
+                    v_types[v['type']] = v_types.get(v['type'], 0) + 1
+                logger.info(
+                    f"诊断 frame={frame_count}/{total_frames} | "
+                    f"confirmed={n_confirmed} | violations={n_violations} {v_types} | "
+                    f"speed_samples={len(counter.speed_samples_mps)}"
+                )
                 update_task_status(task_id, "processing", progress,
-                                   f"处理中... {frame_count}/{total_frames}帧 | 光照: {enhancer.get_lighting_info(frame)}")
+                                   f"处理中... {frame_count}/{total_frames}帧 | 已确认轨迹:{n_confirmed} | 违规:{n_violations}({v_types})")
 
-        # 释放资源
+        # 释放资源（先关HLS再关视频）
+        if hls_proc and hls_proc.poll() is None:
+            try: hls_proc.stdin.close()
+            except: pass
+            try: hls_proc.wait(timeout=5)
+            except: hls_proc.kill()
         if out: out.release(); out = None
         if cap: cap.release(); cap = None
 
@@ -925,7 +1006,7 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         # FFmpeg转码（保持原有）
         if temp_output.exists() and temp_output.stat().st_size > 0:
             update_task_status(task_id, "processing", 96, "转码中...")
-            ffmpeg_cmd = r"D:\ffmpeg\ffmpeg-8.1-essentials_build\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+            ffmpeg_cmd = config.FFMPEG_PATH
 
             if Path(ffmpeg_cmd).exists():
                 try:
@@ -974,13 +1055,31 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             },
             'output_files': {
                 'result_video': str(final_output),
-                'result_video_url': f"/api/analyze/video/{task_id}"
+                'result_video_url': f"/api/analyze/video/{task_id}",
+                'hls_url': f"/api/analyze/hls/{task_id}/stream.m3u8"
             },
             'frame_results': frame_results[:100]
         }
 
-        update_task_status(task_id, "completed", 100, "分析完成！", result=final_result)
-        logger.info(f"任务 {task_id}: 完成 | 类别统计: {class_stats} | 违规: {len(counter.violations)}")
+        # 违规诊断汇总
+        v_summary = {}
+        for v in counter.violations:
+            v_summary[v['type']] = v_summary.get(v['type'], 0) + 1
+        logger.info(
+            f"任务 {task_id}: 完成 | 类别: {class_stats} | "
+            f"违规({len(counter.violations)}): {v_summary} | "
+            f"速度样本: {len(counter.speed_samples_mps)} | "
+            f"参数: parking={counter.parking_frame_threshold}frames, "
+            f"speed_limit={counter.speed_limit_mps*3.6:.0f}km/h, "
+            f"congestion={counter.congestion_vehicle_threshold}veh"
+        )
+
+        update_task_status(
+            task_id, "completed", 100,
+            f"分析完成！检测到{len(counter.violations)}个违规事件"
+            + (f": {v_summary}" if v_summary else f"（阈值: 超速>{counter.speed_limit_mps*3.6:.0f}km/h 违停>{counter.parking_duration_sec}s 拥堵>{counter.congestion_vehicle_threshold}车）"),
+            result=final_result
+        )
 
     except Exception as e:
         logger.error(f"任务 {task_id} 失败: {str(e)}")
@@ -995,7 +1094,9 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
                 temp_output.unlink()
             except:
                 pass
-        if task_id in active_tasks: del active_tasks[task_id]
+        with _tasks_lock:
+            if task_id in active_tasks:
+                del active_tasks[task_id]
         try:
             if video_path.exists(): video_path.unlink()
         except Exception as e:
@@ -1010,7 +1111,8 @@ async def upload_video(
         task_id: str = Form(...),
         file: UploadFile = File(...),
         frame_skip: int = Form(3),
-        detection_lines: Optional[str] = Form(None)
+        detection_lines: Optional[str] = Form(None),
+        meters_per_pixel: float = Form(0.05)
 ):
     """上传视频（接口保持不变）"""
     try:
@@ -1026,13 +1128,23 @@ async def upload_video(
         temp_dir.mkdir(parents=True, exist_ok=True)
         video_path = temp_dir / f"{task_id}{ext}"
 
-        active_tasks[task_id] = {
-            "status": "processing", "start_time": time.time(),
-            "video_path": str(video_path)
-        }
+        with _tasks_lock:
+            active_tasks[task_id] = {
+                "status": "processing", "start_time": time.time(),
+                "video_path": str(video_path)
+            }
 
+        # 分块写入并检查文件大小限制
+        max_bytes = config.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        total_read = 0
         with open(video_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            while chunk := file.file.read(8 * 1024 * 1024):  # 8MB chunks
+                total_read += len(chunk)
+                if total_read > max_bytes:
+                    f.close()
+                    video_path.unlink(missing_ok=True)
+                    raise HTTPException(413, f"文件超过最大限制 {config.MAX_UPLOAD_SIZE_MB}MB")
+                f.write(chunk)
 
         lines = None
         if detection_lines:
@@ -1042,7 +1154,7 @@ async def upload_video(
                 raise HTTPException(400, "detection_lines格式错误")
 
         update_task_status(task_id, "pending", 0, "等待处理")
-        background_tasks.add_task(process_video_task, task_id, video_path, frame_skip, lines)
+        background_tasks.add_task(process_video_task, task_id, video_path, frame_skip, lines, meters_per_pixel)
 
         return JSONResponse({
             "code": 200, "message": "上传成功，开始分析",
@@ -1175,14 +1287,12 @@ async def analyze_single_frame(file: UploadFile = File(...)):
 
         h, w = frame.shape[:2]
 
-        # 增强预处理
+        # 增强预处理 + 自适应阈值（传入 predict，不修改全局状态）
         process_frame = enhancer.enhance(frame)
         adaptive_conf = enhancer.get_adaptive_confidence(frame, config.CONF_THRESHOLD)
-        if hasattr(detector, 'conf_threshold'):
-            detector.conf_threshold = adaptive_conf
 
         start = time.time()
-        detections, _ = detector.predict(process_frame)
+        detections, _ = detector.predict(process_frame, conf_threshold=adaptive_conf)
         infer_time = time.time() - start
 
         # 绘制（保持与原有相同的颜色定义）
@@ -1236,14 +1346,47 @@ async def analyze_single_frame(file: UploadFile = File(...)):
         raise HTTPException(500, str(e))
 
 
+@app.api_route("/api/analyze/hls/{task_id}/{filename}", methods=["GET", "HEAD"])
+async def serve_hls_file(task_id: str, filename: str):
+    """实时HLS流文件服务"""
+    path = config.RESULTS_DIR / f"{task_id}_hls" / filename
+    if not path.exists():
+        logger.warning(f"HLS 404: {path} (dir_exists={path.parent.exists()}, listing={list(path.parent.glob('*')) if path.parent.exists() else 'N/A'})")
+        raise HTTPException(404, f"HLS文件尚未生成 (looking at {path})")
+    if filename.endswith('.m3u8'):
+        return FileResponse(path, media_type="application/vnd.apple.mpegurl")
+    return FileResponse(path, media_type="video/mp2t")
+
+
 @app.post("/api/analyze/cancel/{task_id}")
 async def cancel_task(task_id: str):
     """取消任务"""
-    if task_id in active_tasks:
-        del active_tasks[task_id]
+    with _tasks_lock:
+        found = task_id in active_tasks
+        if found:
+            del active_tasks[task_id]
+    if found:
         update_task_status(task_id, "cancelled", -1, "用户已取消")
         return {"success": True}
     return {"success": False, "message": "任务不存在"}
+
+# 优雅关闭
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("正在关闭服务...")
+    # 取消所有进行中的任务
+    with _tasks_lock:
+        task_ids = list(active_tasks.keys())
+        active_tasks.clear()
+    for tid in task_ids:
+        update_task_status(tid, "cancelled", -1, "服务关闭")
+        logger.info(f"已取消任务: {tid}")
+    if redis_client:
+        try:
+            redis_client.close()
+        except:
+            pass
+    logger.info("服务已关闭")
 
 
 @app.get("/health")

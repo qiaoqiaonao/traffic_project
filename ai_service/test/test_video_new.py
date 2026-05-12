@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from collections import defaultdict
 # 关键修改：从新的推理文件导入（支持4类和NMS）
-from test_inference_new import RTDETRPredictor
+from ai_service.test_inference_new import RTDETRPredictor
 
 
 def process_video(

@@ -8,3 +8,7 @@ temp/uploads/
 
 # 如果 .idea 想完全忽略也加上
 .idea/
+
+ai_service/temp/uploads
+
+ai_service/weights
