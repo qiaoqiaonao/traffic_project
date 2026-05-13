@@ -174,7 +174,7 @@ if not _model_file.is_file():
 
 # 初始化检测器（保持原有逻辑，从test_inference_new导入）
 try:
-    from ai_service.test_inference_new import RTDETRPredictor
+    from test_inference_new import RTDETRPredictor
 
     detector = RTDETRPredictor(
         config.MODEL_PATH,
