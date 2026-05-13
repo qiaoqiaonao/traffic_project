@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass, field
 import logging
 from collections import deque, Counter
@@ -20,22 +20,27 @@ class Track:
     trajectory: deque = field(default_factory=lambda: deque(maxlen=30))
     status: str = "tentative"
     class_name: str = "car"
-    class_history: deque = field(default_factory=lambda: deque(maxlen=15))  # 新增
+    class_history: deque = field(default_factory=lambda: deque(maxlen=15))
 
     def __post_init__(self):
         if self.color_hist is None:
             self.color_hist = np.zeros(512, dtype=np.float32)
         if len(self.trajectory) == 0:
             self.trajectory.append(tuple(self.bbox))
-        # 把初始类别也记入历史，避免前几帧为空
         if self.class_name and len(self.class_history) == 0:
             self.class_history.append(self.class_name)
 
 
 class EnhancedDeepSORT:
+    """
+    增强版 DeepSORT
+    固定摄像头：enable_cmc=False（默认），避免误判车辆运动为相机抖动
+    无人机/手持：enable_cmc=True，补偿相机运动
+    """
+
     def __init__(self, max_age=30, min_hits=3, iou_threshold=0.3,
                  appearance_weight=0.3, use_appearance=True,
-                 enable_cmc=True):
+                 enable_cmc=False):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
@@ -45,22 +50,24 @@ class EnhancedDeepSORT:
 
         self.tracks: List[Track] = []
         self.next_id = 1
-        
-        # CMC 相关
+
+        # CMC 相关（仅 enable_cmc=True 时使用）
         self.prev_gray = None
-        self.affine_matrix = None
 
         logger.info(f"初始化增强版DeepSORT: use_appearance={use_appearance}, "
                     f"appearance_weight={appearance_weight}, enable_cmc={enable_cmc}")
 
-    # ========== CMC：稀疏光流估计仿射矩阵 ==========
+    # ========== CMC：稀疏光流估计仿射矩阵（仅无人机/手持时启用）==========
     def _estimate_affine(self, frame: np.ndarray, detections: List[Dict] = None):
+        if not self.enable_cmc:
+            return None
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.prev_gray is None:
             self.prev_gray = gray
             return None
 
-        # 创建掩码，屏蔽检测框区域，避免运动车辆上的特征点干扰相机运动估计
+        # 创建掩码，屏蔽检测框区域（避免运动车辆上的特征点干扰相机估计）
         mask = np.ones_like(self.prev_gray, dtype=np.uint8) * 255
         if detections:
             for det in detections:
@@ -87,18 +94,15 @@ class EnhancedDeepSORT:
             self.prev_gray = gray
             return None
 
-        # 用 RANSAC 进一步剔除动态点，只保留背景运动一致的特征点
-        # 用 RANSAC 进一步剔除动态点
         M, inliers = cv2.estimateAffinePartial2D(
             pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=3.0
         )
 
-        # 剧烈晃动保护：如果画面整体位移/旋转过大，放弃 CMC
+        # 剧烈晃动保护：位移/旋转过大则放弃 CMC
         if M is not None:
             tx, ty = abs(M[0, 2]), abs(M[1, 2])
             scale_x = np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
             scale_y = np.sqrt(M[1, 0] ** 2 + M[1, 1] ** 2)
-            # 平移超过 30 像素，或缩放比例异常，判定为剧烈晃动/误估计
             if tx > 30 or ty > 30 or not (0.9 < scale_x < 1.1) or not (0.9 < scale_y < 1.1):
                 logger.debug(f"CMC 放弃: 位移({tx:.1f},{ty:.1f}) 或尺度异常")
                 M = None
@@ -114,7 +118,7 @@ class EnhancedDeepSORT:
         pts = cv2.transform(pts.reshape(1, -1, 2), M).reshape(-1, 2)
         return [float(pts[0, 0]), float(pts[0, 1]), float(pts[1, 0]), float(pts[1, 1])]
 
-    # ========== 原有方法 ==========
+    # ========== 外观特征 ==========
     def _extract_color_feature(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
         h, w = frame.shape[:2]
@@ -161,14 +165,13 @@ class EnhancedDeepSORT:
                 iou_dist = 1.0 - iou
                 if self.use_appearance and det_hist is not None:
                     app_dist = self._compute_appearance_dist(det_hist, track.color_hist)
-                    cost = (1 - self.appearance_weight) * iou_dist + self.appearance_weight * app_dist if iou > 0 else 1.0
+                    cost = (
+                                       1 - self.appearance_weight) * iou_dist + self.appearance_weight * app_dist if iou > 0 else 1.0
                 else:
                     cost = iou_dist
                 cost_matrix[i, j] = cost
 
         matches = []
-        unmatched_dets = list(range(len(detections)))
-        unmatched_tracks = list(range(len(self.tracks)))
         matched_dets = set()
         matched_tracks = set()
 
@@ -178,9 +181,7 @@ class EnhancedDeepSORT:
         for det_idx, track_idx in zip(det_indices, track_indices):
             if det_idx in matched_dets or track_idx in matched_tracks:
                 continue
-            det_bbox = detections[det_idx]['bbox']
-            tr_bbox = self.tracks[track_idx].bbox
-            iou = self._compute_iou(det_bbox, tr_bbox)
+            iou = self._compute_iou(detections[det_idx]['bbox'], self.tracks[track_idx].bbox)
             cost = cost_matrix[det_idx, track_idx]
             if iou >= self.iou_threshold and cost < 0.8:
                 matches.append((det_idx, track_idx))
@@ -191,12 +192,12 @@ class EnhancedDeepSORT:
         unmatched_tracks = [i for i in range(len(self.tracks)) if i not in matched_tracks]
         return matches, unmatched_dets, unmatched_tracks
 
-    # ========== 核心 update（增加 CMC） ==========
+    # ========== 核心 update ==========
     def update(self, detections: List[Dict], frame: np.ndarray) -> List[Dict]:
-        # 1. CMC：估计并补偿相机运动
+        # 1. CMC：估计并补偿相机运动（仅启用时）
         M = None
         if self.enable_cmc:
-            M = self._estimate_affine(frame,detections)
+            M = self._estimate_affine(frame, detections)
             if M is not None:
                 for track in self.tracks:
                     track.bbox = self._warp_bbox(track.bbox, M)
@@ -225,10 +226,9 @@ class EnhancedDeepSORT:
             track.bbox = det['bbox']
             track.score = det['score']
 
-            # ===== 类别投票平滑：解决 car/van 跳变 =====
+            # 类别投票平滑
             detected_class = det.get('class_name', 'car')
             track.class_history.append(detected_class)
-            # 取历史中出现次数最多的类别作为当前类别
             track.class_name = Counter(track.class_history).most_common(1)[0][0]
 
             track.time_since_update = 0
@@ -246,20 +246,20 @@ class EnhancedDeepSORT:
                 track.status = "deleted"
 
         # 6. 未匹配检测（初始化新轨迹）
-        # 相机剧烈晃动时，抑制新轨迹初始化，防止背景纹理误检产生幽灵框
+        # 仅在 CMC 启用且相机剧烈晃动时，抑制低置信度新轨迹
         is_camera_shaking = False
         if self.enable_cmc and M is not None:
             tx, ty = abs(M[0, 2]), abs(M[1, 2])
-            # 平移超过 15 像素即认为在晃动（比 CMC 放弃阈值 30 更敏感）
             is_camera_shaking = tx > 15 or ty > 15
 
         for det_idx in unmatched_dets:
             det = detections[det_idx]
-            # 晃动期间，仅对高置信度检测初始化新轨迹（0.7 为经验阈值）
+            # 晃动期间，仅对高置信度检测初始化新轨迹
             if is_camera_shaking and det['score'] < 0.7:
                 continue
 
-            hist = self._extract_color_feature(frame, det['bbox']) if self.use_appearance else np.zeros(512)
+            hist = self._extract_color_feature(frame, det['bbox']) if self.use_appearance else np.zeros(512,
+                                                                                                        dtype=np.float32)
             new_track = Track(
                 track_id=self.next_id,
                 bbox=det['bbox'],
@@ -276,7 +276,7 @@ class EnhancedDeepSORT:
         # 7. 清理
         self.tracks = [t for t in self.tracks if t.status != "deleted"]
 
-        # 8. 返回 confirmed + 高置信度 tentative
+        # 8. 返回
         results = []
         for track in self.tracks:
             item = {
@@ -296,4 +296,3 @@ class EnhancedDeepSORT:
         self.tracks = []
         self.next_id = 1
         self.prev_gray = None
-        self.affine_matrix = None

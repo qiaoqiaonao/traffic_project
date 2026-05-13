@@ -32,15 +32,14 @@ from detection_line import DetectionLine, parse_detection_line, default_vertical
 
 class StaticObjectFilter:
     """
-    轨迹静止过滤器：杀掉长期位移为0的背景误检（建筑、树木）
-    改进：记录轨迹的累计位移，曾经运动过的目标（如等红灯车辆）即使当前静止也保留
+    轨迹静止过滤器：轻微过滤背景误检，但保留 confirmed 真车
     """
-    def __init__(self, min_displacement=40, min_history=5, max_history=20):
+    def __init__(self, min_displacement=15, min_history=5, max_history=15):
         self.min_displacement = min_displacement
         self.min_history = min_history
         self.max_history = max_history
-        self.history = {}          # track_id -> [(cx, cy), ...]
-        self.lifetime_disp = {}    # track_id -> float, 从出生到现在的累计位移
+        self.history = {}
+        self.lifetime_disp = {}
 
     def update(self, tracks):
         current_ids = set()
@@ -57,7 +56,6 @@ class StaticObjectFilter:
                 self.history[tid] = []
                 self.lifetime_disp[tid] = 0.0
 
-            # 计算与上一个记录点的位移，累加到终身位移
             if len(self.history[tid]) > 0:
                 last_cx, last_cy = self.history[tid][-1]
                 step_disp = math.hypot(cx - last_cx, cy - last_cy)
@@ -67,15 +65,14 @@ class StaticObjectFilter:
             if len(self.history[tid]) > self.max_history:
                 self.history[tid].pop(0)
 
-            # 历史不足先保留（避免新目标被误杀）
+            # 历史不足先保留
             if len(self.history[tid]) < self.min_history:
                 filtered.append(t)
                 continue
 
-            # 关键：看"终身累计位移"而不是"窗口内位移"
-            # 曾经运动过 -> 真实车辆（等红灯也保留）
-            # 从未运动过 -> 背景误检（建筑、树木）
-            if self.lifetime_disp.get(tid, 0) < self.min_displacement:
+            # 关键改动：confirmed 真车即使静止也保留；只有 tentative 且从未动过的才过滤
+            is_confirmed = t.get('status') == 'confirmed'
+            if not is_confirmed and self.lifetime_disp.get(tid, 0) < self.min_displacement:
                 continue  # 过滤掉从未动过的幽灵目标
 
             filtered.append(t)
@@ -635,13 +632,10 @@ class ResultVisualizer:
         score = track.get('score', 0)
         class_name = track.get('class_name', 'unknown')
         is_interp = track.get('is_interpolated', False)
-        status = track.get('status', 'unknown')
 
-        # 颜色：confirmed=绿，tentative=黄，interp=灰
+        # 颜色：confirmed=绿，interp=灰（tentative 不再特殊标记，和 confirmed 一样）
         if is_interp:
             color = (128, 128, 128)
-        elif status == 'tentative':
-            color = (0, 255, 255)  # 青色
         else:
             color = ResultVisualizer.COLORS.get(class_name, (0, 255, 0))
 
@@ -652,8 +646,6 @@ class ResultVisualizer:
         label = f"{class_name} ID:{track_id} {score:.2f}"
         if is_interp:
             label += " (interp)"
-        elif status == 'tentative':
-            label += " (new)"
 
         (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
@@ -845,6 +837,8 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         processed_count = 0
         total_detections = 0
         last_frame_sent_time = 0.0
+        last_progress_time = 0.0
+        video_file_size = video_path.stat().st_size if video_path.exists() else 0
         class_stats = {'car': 0, 'bus': 0, 'van': 0, 'others': 0}
 
         update_task_status(task_id, "processing", 10, "开始分析...")
@@ -936,11 +930,11 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             # 流量统计只对 confirmed，杜绝假阳性被计入
             stats = counter.update(confirmed_tracks, frame_count, timestamp)
 
-            # 可视化
+            # 可视化：画出所有轨迹（confirmed + tentative），静止/运动车辆都标注
             vis_frame = frame.copy()
             for line in lines:
                 visualizer.draw_detection_line(vis_frame, line, width, height)
-            for track in confirmed_tracks:
+            for track in all_tracks:  # ← 改这里：confirmed + tentative 都画
                 visualizer.draw_detection(vis_frame, track)
 
             out.write(vis_frame)
@@ -967,27 +961,29 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
                 frame_results = frame_results[-config.MAX_FRAME_RESULTS:]
             processed_count += 1
 
-            # 更新进度 + 违规诊断日志
-            if processed_count % 30 == 0:
+            # 更新进度：每10帧或超过2秒强制更新，保持前端进度条丝滑
+            _now = time.time()
+            if processed_count % 10 == 0 or (_now - last_progress_time > 2.0):
+                last_progress_time = _now
                 with _tasks_lock:
                     if task_id not in active_tasks:
                         is_cancelled = True
                 if is_cancelled:
                     break
-                progress = min(95, int(frame_count / total_frames * 100)) if total_frames > 0 else 0
-                # 诊断：输出当前违规统计
+
+                # 进度：total_frames=0 时用文件字节位置估算
+                if total_frames > 0:
+                    progress = min(95, int(frame_count / total_frames * 100))
+                elif video_file_size > 0:
+                    progress = min(95, int(cap.get(cv2.CAP_PROP_POS_FRAMES) / max(total_frames, 1) * 100)) if total_frames > 0 else min(90, processed_count)
+                else:
+                    progress = min(90, processed_count)
+
                 n_confirmed = len(confirmed_tracks)
                 n_violations = len(counter.violations)
-                v_types = {}
-                for v in counter.violations:
-                    v_types[v['type']] = v_types.get(v['type'], 0) + 1
-                logger.info(
-                    f"诊断 frame={frame_count}/{total_frames} | "
-                    f"confirmed={n_confirmed} | violations={n_violations} {v_types} | "
-                    f"speed_samples={len(counter.speed_samples_mps)}"
-                )
+                frame_info = f"{frame_count}/{total_frames}" if total_frames > 0 else f"{frame_count}"
                 update_task_status(task_id, "processing", progress,
-                                   f"处理中... {frame_count}/{total_frames}帧 | 已确认轨迹:{n_confirmed} | 违规:{n_violations}({v_types})")
+                                   f"处理中... {frame_info}帧 | 轨迹:{n_confirmed} | 违规:{n_violations}")
 
         # 释放资源（先关HLS再关视频）
         if hls_proc and hls_proc.poll() is None:

@@ -49,6 +49,8 @@ class Config:
     ENABLE_APPEARANCE: bool = True  # 是否启用外观特征
 
     # ========== 方案2：相机运动补偿（CMC）总开关 ==========
+    # 固定摄像头：False（默认），避免误判车辆运动为相机抖动产生幽灵框
+    # 无人机/手持拍摄：改为 True
     ENABLE_CMC: bool = False
 
     # 轨迹插值配置（开题报告优化点：遮挡恢复）
