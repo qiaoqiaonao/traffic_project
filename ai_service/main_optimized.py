@@ -20,6 +20,7 @@ import redis
 import logging
 import math
 import subprocess
+import queue  # 新增：异步帧解码需要
 from typing import List, Optional, Dict
 from datetime import datetime
 
@@ -29,6 +30,45 @@ from enhanced_tracker import EnhancedDeepSORT
 from trajectory_interpolator import TrajectoryInterpolator
 from image_enhancement import ImageEnhancer
 from detection_line import DetectionLine, parse_detection_line, default_vertical_line
+
+class AsyncFrameReader:
+    """
+    异步帧预读取器：用独立线程解码视频帧，解耦 IO 和推理
+    让 CPU 在等待解码的同时进行推理，提升整体吞吐
+    """
+    def __init__(self, cap: cv2.VideoCapture, maxsize: int = 5, frame_skip: int = 1):
+        self.cap = cap
+        self.frame_skip = frame_skip
+        self.frame_queue = queue.Queue(maxsize=maxsize)
+        self.stopped = False
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+        self._frame_counter = 0
+
+    def _read_loop(self):
+        while not self.stopped:
+            if self.frame_queue.full():
+                time.sleep(0.001)
+                continue
+            ret, frame = self.cap.read()
+            if not ret:
+                self.frame_queue.put((False, None))
+                break
+            self._frame_counter += 1
+            if self.frame_skip <= 1 or self._frame_counter % self.frame_skip == 0:
+                self.frame_queue.put((True, frame))
+
+    def read(self):
+        """阻塞读取一帧，返回 (ret, frame)"""
+        return self.frame_queue.get()
+
+    def stop(self):
+        self.stopped = True
+        try:
+            self.thread.join(timeout=1.0)
+        except Exception:
+            pass
+
 
 class StaticObjectFilter:
     """
@@ -843,6 +883,11 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
 
         update_task_status(task_id, "processing", 10, "开始分析...")
 
+        # ===== 优化：启动异步帧解码器 =====
+        reader_skip = 1 if frame_skip > 1 else 1
+        frame_reader = AsyncFrameReader(cap, maxsize=5, frame_skip=reader_skip)
+        logger.info(f"异步帧解码已启动 (buffer=5)")
+
         while True:
             with _tasks_lock:
                 if task_id not in active_tasks:
@@ -852,8 +897,9 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             if is_cancelled:
                 break
 
-            ret, frame = cap.read()
-            if not ret:
+            # ===== 优化：从异步读取器获取帧（非阻塞等待）=====
+            ret, frame = frame_reader.read()
+            if not ret or frame is None:
                 break
 
             frame_count += 1
@@ -1083,6 +1129,9 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         is_cancelled = True
 
     finally:
+        # ===== 优化：确保异步读取器被关闭 =====
+        if 'frame_reader' in locals() and frame_reader:
+            frame_reader.stop()
         if out: out.release()
         if cap: cap.release()
         if temp_output and temp_output.exists():

@@ -135,6 +135,13 @@ class EnhancedDeepSORT:
         hist = cv2.normalize(hist, hist).flatten()
         return hist.astype(np.float32)
 
+    def _get_detection_feature(self, det, frame):
+        """获取检测框的外观特征：优先使用检测器预计算的特征，没有则兜底提取"""
+        if 'color_hist' in det and det['color_hist'] is not None:
+            return det['color_hist']
+        # 兜底：兼容未预计算特征的调用方式
+        return self._extract_color_feature(frame, det['bbox']) if self.use_appearance else None
+
     def _compute_iou(self, bbox1, bbox2):
         x1 = max(bbox1[0], bbox2[0])
         y1 = max(bbox1[1], bbox2[1])
@@ -159,7 +166,7 @@ class EnhancedDeepSORT:
 
         cost_matrix = np.zeros((len(detections), len(self.tracks)), dtype=np.float32)
         for i, det in enumerate(detections):
-            det_hist = self._extract_color_feature(frame, det['bbox']) if self.use_appearance else None
+            det_hist = self._get_detection_feature(det, frame) if self.use_appearance else None
             for j, track in enumerate(self.tracks):
                 iou = self._compute_iou(det['bbox'], track.bbox)
                 iou_dist = 1.0 - iou
@@ -234,8 +241,9 @@ class EnhancedDeepSORT:
             track.time_since_update = 0
             track.hits += 1
             track.trajectory.append(tuple(det['bbox']))
-            new_hist = self._extract_color_feature(frame, det['bbox'])
-            track.color_hist = 0.9 * track.color_hist + 0.1 * new_hist
+            new_hist = self._get_detection_feature(det, frame)
+            if new_hist is not None:
+                track.color_hist = 0.9 * track.color_hist + 0.1 * new_hist
             if track.status == "tentative" and track.hits >= self.min_hits:
                 track.status = "confirmed"
 
@@ -258,8 +266,9 @@ class EnhancedDeepSORT:
             if is_camera_shaking and det['score'] < 0.7:
                 continue
 
-            hist = self._extract_color_feature(frame, det['bbox']) if self.use_appearance else np.zeros(512,
-                                                                                                        dtype=np.float32)
+            hist = self._get_detection_feature(det, frame) if self.use_appearance else None
+            if hist is None:
+                hist = np.zeros(512, dtype=np.float32)
             new_track = Track(
                 track_id=self.next_id,
                 bbox=det['bbox'],
