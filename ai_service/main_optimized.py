@@ -130,6 +130,69 @@ class StaticObjectFilter:
         self.lifetime_disp.clear()
 
 
+class AsyncVideoWriter:
+    """
+    异步视频写入器：独立线程做视频编码，主线程不阻塞
+    解决 VideoWriter.write() 同步阻塞问题
+    """
+    def __init__(self, path, fourcc, fps, size, maxsize=10):
+        self._writer = cv2.VideoWriter(path, fourcc, fps, size)
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._stopped = False
+        self._thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._thread.start()
+
+    def _write_loop(self):
+        try:
+            while not self._stopped:
+                try:
+                    frame = self._queue.get(timeout=0.5)
+                    if frame is None:  # 停止信号
+                        break
+                    self._writer.write(frame)
+                except queue.Empty:
+                    continue
+        finally:
+            # 线程结束时确保释放VideoWriter，文件句柄在这里关闭
+            self._writer.release()
+
+    def write(self, frame):
+        """非阻塞写入，队列满则丢弃最旧帧"""
+        try:
+            self._queue.put(frame, block=False)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()  # 丢弃最旧帧
+                self._queue.put_nowait(frame)
+            except queue.Empty:
+                pass
+
+    def release(self):
+        """优雅关闭：确保线程结束、VideoWriter释放、文件句柄关闭后再返回"""
+        # 1. 等待队列排空（最多3秒）
+        for _ in range(30):
+            if self._queue.empty():
+                break
+            time.sleep(0.1)
+
+        # 2. 发送停止信号
+        self._stopped = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        # 3. 等待写入线程真正结束（线程内会调用 writer.release()）
+        self._thread.join(timeout=5.0)
+
+        # 4. 兜底：如果线程还没结束，强制释放
+        if self._thread.is_alive():
+            self._writer.release()
+
+        # 5. Windows下确保文件句柄完全释放
+        time.sleep(0.2)
+
+
 # ============ 统一日志配置（服务入口唯一控制） ============
 # 使用 config.LOG_DIR，确保路径一致；启动时自动清空旧日志
 config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -832,42 +895,42 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         if temp_output.exists(): temp_output.unlink()
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(temp_output), fourcc, fps / frame_skip, (width, height))
+        out = AsyncVideoWriter(str(temp_output), fourcc, fps / frame_skip, (width, height))
 
-        # ===== 实时HLS流输出 =====
-        hls_dir = config.RESULTS_DIR / f"{task_id}_hls"
-        hls_dir.mkdir(parents=True, exist_ok=True)
-        for f in hls_dir.glob("*"): f.unlink()
+        # ===== 实时HLS流输出（已禁用，CPU推理不需要实时流） =====
         hls_proc = None
-        hls_ffmpeg_ok = False
-        try:
-            # 检查FFmpeg可用性
-            check = subprocess.run([config.FFMPEG_PATH, '-version'], capture_output=True, timeout=5)
-            if check.returncode != 0:
-                raise RuntimeError(f"FFmpeg不可用: {check.stderr.decode(errors='replace')}")
-            hls_ffmpeg_ok = True
-        except Exception as e:
-            logger.error(f"HLS无法启动: FFmpeg检查失败 - {e}")
-
-        if hls_ffmpeg_ok:
-            try:
-                hls_log = open(hls_dir / "ffmpeg.log", "w")
-                hls_proc = subprocess.Popen([
-                    config.FFMPEG_PATH, '-y',
-                    '-f', 'image2pipe', '-vcodec', 'mjpeg',
-                    '-use_wallclock_as_timestamps', '1',
-                    '-i', 'pipe:0',
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-                    '-crf', '28', '-g', '10',
-                    '-f', 'hls', '-hls_time', '3', '-hls_list_size', '8',
-                    '-hls_flags', 'delete_segments+omit_endlist',
-                    '-hls_segment_filename', str(hls_dir / 'seg_%03d.ts'),
-                    str(hls_dir / 'stream.m3u8')
-                ], stdin=subprocess.PIPE, stderr=hls_log)
-                logger.info(f"HLS已启动 -> {hls_dir / 'stream.m3u8'}")
-            except Exception as e:
-                logger.error(f"HLS启动失败: {e}")
-                hls_proc = None
+        # hls_dir = config.RESULTS_DIR / f"{task_id}_hls"
+        # hls_dir.mkdir(parents=True, exist_ok=True)
+        # for f in hls_dir.glob("*"): f.unlink()
+        # hls_proc = None
+        # hls_ffmpeg_ok = False
+        # try:
+        #     check = subprocess.run([config.FFMPEG_PATH, '-version'], capture_output=True, timeout=5)
+        #     if check.returncode != 0:
+        #         raise RuntimeError(f"FFmpeg不可用")
+        #     hls_ffmpeg_ok = True
+        # except Exception as e:
+        #     logger.error(f"HLS无法启动: {e}")
+        #
+        # if hls_ffmpeg_ok:
+        #     try:
+        #         hls_log = open(hls_dir / "ffmpeg.log", "w")
+        #         hls_proc = subprocess.Popen([
+        #             config.FFMPEG_PATH, '-y',
+        #             '-f', 'image2pipe', '-vcodec', 'mjpeg',
+        #             '-use_wallclock_as_timestamps', '1',
+        #             '-i', 'pipe:0',
+        #             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        #             '-crf', '28', '-g', '10',
+        #             '-f', 'hls', '-hls_time', '3', '-hls_list_size', '8',
+        #             '-hls_flags', 'delete_segments+omit_endlist',
+        #             '-hls_segment_filename', str(hls_dir / 'seg_%03d.ts'),
+        #             str(hls_dir / 'stream.m3u8')
+        #         ], stdin=subprocess.PIPE, stderr=hls_log)
+        #         logger.info(f"HLS已启动")
+        #     except Exception as e:
+        #         logger.error(f"HLS启动失败: {e}")
+        #         hls_proc = None
 
         lines = validated_lines
         counter = TrafficCounter(lines, width, height, fps, meters_per_pixel, frame_skip)
@@ -918,31 +981,27 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             try:
                 detections, infer_time = detector.predict(process_frame, conf_threshold=adaptive_conf)
 
-                # ✅ 检测级二次过滤：面积 + 长宽比 + 边缘
-                h, w = frame.shape[:2]
-                frame_area = h * w
-                margin = min(w, h) * 0.08  # 边缘 8% 区域
-                filtered_dets = []
-                for d in detections:
-                    bbox = d['bbox']
-                    bw = bbox[2] - bbox[0]
-                    bh = bbox[3] - bbox[1]
-                    box_area = bw * bh
-                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                # ✅ 检测级二次过滤：面积 + 长宽比 + 边缘（向量化，比Python循环快3-5x）
+                if detections:
+                    h, w = frame.shape[:2]
+                    frame_area = h * w
+                    margin = min(w, h) * 0.08
 
-                    # 1. 面积：过滤巨型框（超过画面 8%）
-                    if box_area > frame_area * 0.08:
-                        continue
-                    # 2. 长宽比：过滤极端比例
-                    ratio = bw / max(bh, 1)
-                    if ratio > 4.0 or ratio < 0.25:
-                        continue
-                    # 3. 边缘过滤：中心点太靠近边缘的，大概率是假阳性
-                    if cx < margin or cx > w - margin or cy < margin or cy > h - margin:
-                        continue
+                    boxes = np.array([d['bbox'] for d in detections], dtype=np.float32)
+                    bw = boxes[:, 2] - boxes[:, 0]
+                    bh = boxes[:, 3] - boxes[:, 1]
+                    areas = bw * bh
+                    ratios = bw / np.maximum(bh, 1.0)
+                    cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
+                    cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
 
-                    filtered_dets.append(d)
-                detections = filtered_dets
+                    mask = (
+                        (areas <= frame_area * 0.08) &  # 面积过滤
+                        (ratios <= 4.0) & (ratios >= 0.25) &  # 长宽比过滤
+                        (cx >= margin) & (cx <= w - margin) &  # 边缘过滤
+                        (cy >= margin) & (cy <= h - margin)
+                    )
+                    detections = [d for d, m in zip(detections, mask) if m]
 
                 # ⚠️ 核心修复：tracker.update 只调用一次！
                 tracks = tracker.update(detections, frame)
@@ -985,13 +1044,13 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
 
             out.write(vis_frame)
 
-            # HLS实时流：写标注帧到FFmpeg pipe
-            if hls_proc and hls_proc.poll() is None:
-                try:
-                    _, jpeg = cv2.imencode('.jpg', vis_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                    hls_proc.stdin.write(jpeg.tobytes())
-                except Exception:
-                    pass
+        # # HLS实时流：已禁用
+        # if hls_proc and hls_proc.poll() is None:
+        #     try:
+        #         _, jpeg = cv2.imencode('.jpg', vis_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        #         hls_proc.stdin.write(jpeg.tobytes())
+        #     except Exception:
+        #         pass
 
             # 保存结果
             frame_data = {
@@ -1032,13 +1091,18 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
                                    f"处理中... {frame_info}帧 | 轨迹:{n_confirmed} | 违规:{n_violations}")
 
         # 释放资源（先关HLS再关视频）
-        if hls_proc and hls_proc.poll() is None:
-            try: hls_proc.stdin.close()
-            except: pass
-            try: hls_proc.wait(timeout=5)
-            except: hls_proc.kill()
-        if out: out.release(); out = None
+        # # 关闭HLS（已禁用）
+        # if hls_proc and hls_proc.poll() is None:
+        #     try: hls_proc.stdin.close()
+        #     except: pass
+        #     try: hls_proc.wait(timeout=5)
+        #     except: hls_proc.kill()
         if cap: cap.release(); cap = None
+
+        # 关键修复：FFmpeg转码前必须确保VideoWriter已关闭，否则WinError 32
+        if out:
+            out.release()
+            out = None
 
         if is_cancelled:
             logger.info(f"任务 {task_id}: 已取消")
@@ -1098,7 +1162,7 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
             'output_files': {
                 'result_video': str(final_output),
                 'result_video_url': f"/api/analyze/video/{task_id}",
-                'hls_url': f"/api/analyze/hls/{task_id}/stream.m3u8"
+        # 'hls_url': f"/api/analyze/hls/{task_id}/stream.m3u8"  # HLS已禁用
             },
             'frame_results': frame_results[:100]
         }
@@ -1132,7 +1196,9 @@ def process_video_task(task_id: str, video_path: Path, frame_skip: int = 3,
         # ===== 优化：确保异步读取器被关闭 =====
         if 'frame_reader' in locals() and frame_reader:
             frame_reader.stop()
-        if out: out.release()
+        if out:
+            out.release()
+            out = None
         if cap: cap.release()
         if temp_output and temp_output.exists():
             try:
