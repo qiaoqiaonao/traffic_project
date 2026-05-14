@@ -360,6 +360,7 @@ class TrafficCounter:
         self._parking_fired = set()
         self._wrong_direction_fired = set()
         self._speeding_fired = set()
+        self._congestion_counter = {}
 
         # ========== 异常检测参数 ==========
         # 违停
@@ -503,13 +504,41 @@ class TrafficCounter:
         }
 
     # ========== 违停 ==========
+    def _is_at_intersection(self, center, margin=200):
+        """判断车辆是否在路口检测线附近（等红绿灯区域）"""
+        cx, cy = center
+        for line in self.lines:
+            lx1 = line.x1 * self.frame_width
+            ly1 = line.y1 * self.frame_height
+            lx2 = line.x2 * self.frame_width
+            ly2 = line.y2 * self.frame_height
+            # 计算点到线段的距离
+            line_len_sq = (lx2 - lx1) ** 2 + (ly2 - ly1) ** 2
+            if line_len_sq < 1:
+                dist = math.hypot(cx - lx1, cy - ly1)
+            else:
+                t = max(0, min(1, ((cx - lx1) * (lx2 - lx1) + (cy - ly1) * (ly2 - ly1)) / line_len_sq))
+                proj_x = lx1 + t * (lx2 - lx1)
+                proj_y = ly1 + t * (ly2 - ly1)
+                dist = math.hypot(cx - proj_x, cy - proj_y)
+            if dist < margin:
+                return True
+        return False
+
     def _check_parking(self, track_id, center, speed_mps, frame_idx, timestamp, still_px):
+        """
+        违停检测（优化版）
+        - 滑动窗口：容忍偶尔移动，连续静止才计数
+        - 放宽条件：speed < 2.0 且 distance < still_px * 1.5
+        - 路口排除：在检测线附近（等红绿灯区域）的车辆不视为违停
+        """
         if track_id not in self.stationary_frames:
             self.stationary_frames[track_id] = {
                 'position': center,
                 'frames': 0,
                 'start_frame': frame_idx,
-                'last_moving_frame': frame_idx if speed_mps > self.parking_speed_threshold_mps else None
+                'last_moving_frame': frame_idx if speed_mps > self.parking_speed_threshold_mps else None,
+                'stationary_window': []  # 滑动窗口：记录最近 N 帧的静止状态
             }
             return
 
@@ -518,15 +547,27 @@ class TrafficCounter:
         dy = center[1] - info['position'][1]
         distance = math.hypot(dx, dy)
 
-        is_stationary = (speed_mps < self.parking_speed_threshold_mps) or (distance < still_px)
+        # 放宽条件：必须同时满足 speed 低 AND 位移小（用 and 替代 or）
+        is_stationary = (speed_mps < 2.0) and (distance < still_px * 1.5)
 
-        if is_stationary:
+        # 滑动窗口：记录最近 10 帧的静止状态
+        window = info.get('stationary_window', [])
+        window.append(1 if is_stationary else 0)
+        if len(window) > 10:
+            window.pop(0)
+        info['stationary_window'] = window
+
+        # 只有当窗口中 80% 以上帧是静止的，才增加计数
+        # 这样容忍偶尔 2 帧的移动（抖动/检测误差），不会 reset
+        if len(window) >= 5 and sum(window) >= len(window) * 0.8:
             info['frames'] += 1
-        else:
-            info['position'] = center
-            info['frames'] = 0
-            info['start_frame'] = frame_idx
-            info['last_moving_frame'] = frame_idx
+        elif not is_stationary:
+            # 连续移动才真正 reset
+            if sum(window[-3:]) == 0:  # 最近 3 帧都在移动
+                info['position'] = center
+                info['frames'] = 0
+                info['start_frame'] = frame_idx
+                info['last_moving_frame'] = frame_idx
 
         if (info['frames'] > self.parking_frame_threshold and
                 track_id not in self._parking_fired):
@@ -536,10 +577,16 @@ class TrafficCounter:
                 max_speed = max(self.track_speed_history[track_id])
                 has_moved = max_speed > self.parking_min_movement_mps
 
-            near_line = self._is_near_any_line(center, margin=100)
+            # 路口排除：在检测线附近 200px 内的车辆，可能是等红绿灯
+            is_intersection = self._is_at_intersection(center, margin=200)
 
-            if has_moved and not near_line:
+            # 在路口区域需要更长的静止时间才判定违停（等红灯通常 3-5 秒）
+            intersection_extra_frames = int(5.0 * self.fps / self.frame_skip) if is_intersection else 0
+            required_frames = self.parking_frame_threshold + intersection_extra_frames
+
+            if has_moved and info['frames'] > required_frames:
                 duration_sec = info['frames'] * self.frame_skip / self.fps
+                reason = 'stationary_at_intersection' if is_intersection else 'stationary_timeout'
                 self.violations.append({
                     'type': 'illegal_parking',
                     'track_id': track_id,
@@ -548,20 +595,30 @@ class TrafficCounter:
                     'frame': frame_idx,
                     'location': [float(center[0]), float(center[1])],
                     'duration_sec': round(duration_sec, 1),
-                    'reason': 'stationary_timeout'
+                    'reason': reason
                 })
                 self._parking_fired.add(track_id)
 
     # ========== 逆行 ==========
     def _check_wrong_direction(self, track_id, center, line, line_px, frame_idx, timestamp, vehicle_type):
+        """
+        逆行检测（优化版）
+        - 更多历史帧：从 3 帧改为 8 帧，更稳定的判断
+        - 角度阈值：要求速度方向与道路方向夹角 > 120 度（cos < -0.5）
+        - 增加逆行速度分量占比判断
+        """
         if track_id not in self.track_velocity_history:
             return
-        if len(self.track_velocity_history[track_id]) < 2:
+
+        # 需要至少 5 帧历史（原先是 2）
+        velocity_history = self.track_velocity_history[track_id]
+        if len(velocity_history) < 5:
             return
         if track_id in self._wrong_direction_fired:
             return
 
-        recent_v = self.track_velocity_history[track_id][-3:]
+        # 用最近 8 帧（原先是 3），更稳定的平均
+        recent_v = velocity_history[-8:]
         avg_vx = sum(v[0] for v in recent_v) / len(recent_v)
         avg_vy = sum(v[1] for v in recent_v) / len(recent_v)
         avg_speed_mps = math.hypot(avg_vx, avg_vy) * self.meters_per_pixel
@@ -569,22 +626,42 @@ class TrafficCounter:
         if avg_speed_mps < self.wrong_direction_min_speed_mps:
             return
 
+        # 计算道路方向向量
         road_dx = line_px[2] - line_px[0]
         road_dy = line_px[3] - line_px[1]
-        dot = avg_vx * road_dx + avg_vy * road_dy
-        if dot < 0:
-            self.violations.append({
-                'type': 'wrong_direction',
-                'track_id': track_id,
-                'vehicle_type': vehicle_type,
-                'timestamp': timestamp,
-                'frame': frame_idx,
-                'location': [float(center[0]), float(center[1])],
-                'line': line.name,
-                'reason': 'direction_opposite',
-                'speed_kmh': round(avg_speed_mps * 3.6, 1)
-            })
-            self._wrong_direction_fired.add(track_id)
+        road_len = math.hypot(road_dx, road_dy)
+        if road_len < 1e-6:
+            return
+
+        # 归一化道路方向和速度方向
+        road_nx, road_ny = road_dx / road_len, road_dy / road_len
+        v_len = math.hypot(avg_vx, avg_vy)
+        if v_len < 1e-6:
+            return
+        vn_x, vn_y = avg_vx / v_len, avg_vy / v_len
+
+        # 计算夹角余弦：cos(theta) = dot(v, road)
+        cos_theta = vn_x * road_nx + vn_y * road_ny
+
+        # 角度阈值：只有当夹角 > 120 度（cos < -0.5）才可能是逆行
+        # 这比原来的 dot < 0 更严格，避免横向偏移误判
+        if cos_theta < -0.5:
+            # 额外判断：逆行速度分量占总速度的比例 > 60%
+            # 即 cos_theta 的绝对值 > 0.6，更确定是逆行而非侧向移动
+            if abs(cos_theta) > 0.6:
+                self.violations.append({
+                    'type': 'wrong_direction',
+                    'track_id': track_id,
+                    'vehicle_type': vehicle_type,
+                    'timestamp': timestamp,
+                    'frame': frame_idx,
+                    'location': [float(center[0]), float(center[1])],
+                    'line': line.name,
+                    'reason': 'direction_opposite',
+                    'speed_kmh': round(avg_speed_mps * 3.6, 1),
+                    'angle': round(math.degrees(math.acos(max(-1, min(1, cos_theta)))), 1)
+                })
+                self._wrong_direction_fired.add(track_id)
 
     # ========== 超速（中位数滤波） ==========
     def _check_speeding(self, track_id, center, frame_idx, timestamp):
@@ -622,7 +699,14 @@ class TrafficCounter:
 
     # ========== 拥堵 ==========
     def _check_congestion(self, track_data, frame_idx, timestamp):
+        """
+        拥堵检测（优化版）
+        - 需要连续 5 帧满足条件才触发，避免瞬间聚集误报
+        - 条件不满足时重置计数器
+        """
         if not track_data:
+            # 无车时清空所有拥堵计数
+            self._congestion_counter.clear()
             return
 
         for line in self.lines:
@@ -636,9 +720,19 @@ class TrafficCounter:
                 if dist < self.congestion_distance_px:
                     nearby.append(data)
 
+            # 判断是否满足拥堵条件
+            is_congested = False
             if len(nearby) >= self.congestion_vehicle_threshold:
                 avg_speed = sum(d['speed_mps'] for d in nearby) / len(nearby)
                 if avg_speed < self.congestion_speed_threshold_mps:
+                    is_congested = True
+
+            if is_congested:
+                # 连续计数 +1
+                self._congestion_counter[line.name] = self._congestion_counter.get(line.name, 0) + 1
+
+                # 需要连续 5 帧（约 0.5 秒）才触发
+                if self._congestion_counter[line.name] >= 5:
                     already = any(
                         v.get('line') == line.name and v['type'] == 'congestion'
                         for v in self.violations
@@ -652,6 +746,9 @@ class TrafficCounter:
                             'vehicle_count': len(nearby),
                             'avg_speed_kmh': round(avg_speed * 3.6, 1)
                         })
+            else:
+                # 条件不满足，重置该线路计数器
+                self._congestion_counter.pop(line.name, None)
 
     def _is_near_any_line(self, center, margin=100):
         cx, cy = center
